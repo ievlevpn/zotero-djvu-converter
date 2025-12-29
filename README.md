@@ -12,7 +12,7 @@ A Zotero 7/8 plugin that converts DJVU files to PDF with optional OCR and compre
 - **Automatic Detection**: Prompts to convert when DJVU files are added to your library
 - **Manual Conversion**: Right-click context menu for converting DJVU files
 - **OCR Support**: Add searchable text layer to PDFs (supports 12 languages)
-- **PDF Compression**: Reduce file size using Ghostscript
+- **PDF Compression**: Reduce file size using ocrmypdf optimization
 - **Flexible Options**: Choose to replace original or keep both files
 - **Progress Tracking**: Visual progress with cancel button
 - **Size Reporting**: Shows file size at each conversion stage
@@ -30,11 +30,8 @@ A Zotero 7/8 plugin that converts DJVU files to PDF with optional OCR and compre
 # Required for DJVU conversion
 brew install djvulibre
 
-# Required for OCR
+# Required for OCR and PDF compression
 brew install ocrmypdf tesseract tesseract-lang
-
-# Required for PDF compression
-brew install ghostscript
 ```
 
 #### Linux (Debian/Ubuntu)
@@ -43,11 +40,8 @@ brew install ghostscript
 # Required for DJVU conversion
 sudo apt install djvulibre-bin
 
-# Required for OCR
+# Required for OCR and PDF compression
 sudo apt install ocrmypdf tesseract-ocr tesseract-ocr-eng
-
-# Required for PDF compression
-sudo apt install ghostscript
 ```
 
 #### Linux (Fedora/RHEL)
@@ -56,11 +50,8 @@ sudo apt install ghostscript
 # Required for DJVU conversion
 sudo dnf install djvulibre
 
-# Required for OCR
+# Required for OCR and PDF compression
 sudo dnf install ocrmypdf tesseract tesseract-langpack-eng
-
-# Required for PDF compression
-sudo dnf install ghostscript
 ```
 
 #### Windows
@@ -71,18 +62,15 @@ Using [Chocolatey](https://chocolatey.org/):
 # Required for DJVU conversion
 choco install djvulibre
 
-# Required for OCR
+# Required for OCR and PDF compression
 choco install tesseract
 pip install ocrmypdf
-
-# Required for PDF compression
-choco install ghostscript
 ```
 
 Alternatively, download installers from:
 - [DjVuLibre](http://djvu.sourceforge.net/djvulibre-windows.html)
 - [Tesseract](https://github.com/UB-Mannheim/tesseract/wiki)
-- [Ghostscript](https://www.ghostscript.com/releases/gsdnld.html)
+- [OCRmyPDF](https://ocrmypdf.readthedocs.io/en/latest/installation.html)
 
 ## Installation
 
@@ -111,7 +99,7 @@ Right-click on items in your library to access:
 |--------|-------------|
 | Add OCR text layer | Makes the PDF searchable (requires ocrmypdf + tesseract) |
 | OCR Languages | Select one or more languages for OCR |
-| Compress PDF | Reduces file size (requires ghostscript) |
+| Compress PDF | Reduces file size (requires ocrmypdf) |
 | Replace DJVU with PDF | Removes original DJVU after conversion |
 | Keep both files | Adds PDF as sibling attachment |
 
@@ -131,7 +119,7 @@ cd zotero-djvu-converter
 # Build the plugin
 bash build.sh
 
-# Output: build/djvu-converter-1.1.0.xpi
+# Output: build/djvu-converter-1.4.0.xpi
 ```
 
 ## Project Structure
@@ -163,12 +151,6 @@ Install OCR dependencies:
 - **Linux**: `sudo apt install ocrmypdf tesseract-ocr`
 - **Windows**: `choco install tesseract` and `pip install ocrmypdf`
 
-### "ghostscript not found" error
-Install ghostscript:
-- **macOS**: `brew install ghostscript`
-- **Linux**: `sudo apt install ghostscript`
-- **Windows**: `choco install ghostscript`
-
 ### OCR is slow
 OCR processing time depends on file size and page count. Large files may take several minutes. You can cancel the operation using the Cancel button.
 
@@ -189,6 +171,5 @@ MIT License - see [LICENSE](LICENSE) file.
 ## Acknowledgments
 
 - [DjVuLibre](http://djvu.sourceforge.net/) - DJVU tools
-- [OCRmyPDF](https://ocrmypdf.readthedocs.io/) - OCR processing
+- [OCRmyPDF](https://ocrmypdf.readthedocs.io/) - OCR and PDF optimization
 - [Tesseract](https://github.com/tesseract-ocr/tesseract) - OCR engine
-- [Ghostscript](https://www.ghostscript.com/) - PDF compression
