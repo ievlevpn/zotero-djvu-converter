@@ -2341,6 +2341,13 @@ class ZoteroDJVUConverter {
 
       self.log(`OCR command: ${ocrCmd}`);
 
+      // Clean up any leftover files from previous cancelled runs
+      try { await IOUtils.remove(markerFile); } catch (e) {}
+      try { await IOUtils.remove(errorFile); } catch (e) {}
+      try { await IOUtils.remove(errorLogFile); } catch (e) {}
+      try { await IOUtils.remove(pidFile); } catch (e) {}
+      try { await IOUtils.remove(outputPath); } catch (e) {}
+
       // Start background process using helper
       self.startBackgroundProcess(ocrCmd, markerFile, errorFile, pidFile);
 
@@ -2386,9 +2393,9 @@ class ZoteroDJVUConverter {
               if (pageNum) {
                 const currentPage = parseInt(pageNum[1], 10);
                 if (pageCount && pageCount > 0) {
-                  pageInfo = ` (page ${currentPage}/${pageCount})`;
+                  pageInfo = ` • page ${currentPage}/${pageCount}`;
                 } else {
-                  pageInfo = ` (page ${currentPage})`;
+                  pageInfo = ` • page ${currentPage}`;
                 }
               }
             }
@@ -2397,7 +2404,7 @@ class ZoteroDJVUConverter {
           // Log file might not exist yet
         }
 
-        progress.updateText(`Running OCR... ${elapsedSec}s${pageInfo}`);
+        progress.updateText(`Running OCR${pageInfo} • ${elapsedSec}s`);
 
         // Check if done
         let done = false;
@@ -2454,8 +2461,62 @@ class ZoteroDJVUConverter {
     });
   }
 
+  async getDjvuPageCount(inputPath) {
+    const self = this;
+    return new Promise((resolve) => {
+      try {
+        // Find djvused (part of djvulibre, same as ddjvu)
+        const djvusedPath = self.ddjvuPath.replace(/ddjvu([^\/\\]*)$/, "djvused$1");
+        const tempFile = PathUtils.join(Zotero.getTempDirectory().path, `djvu_pagecount_${Date.now()}.txt`);
+
+        let cmd;
+        if (self.isWindows()) {
+          const escapedInput = self.escapeWindowsPath(inputPath);
+          const escapedTool = self.escapeWindowsPath(djvusedPath);
+          const escapedTemp = self.escapeWindowsPath(tempFile);
+          cmd = `"${escapedTool}" "${escapedInput}" -e "n" > "${escapedTemp}" 2>&1`;
+        } else {
+          const escapedInput = self.escapeShellPath(inputPath);
+          const escapedTemp = self.escapeShellPath(tempFile);
+          cmd = `"${djvusedPath}" "${escapedInput}" -e 'n' > "${escapedTemp}" 2>&1`;
+        }
+
+        const process = Components.classes["@mozilla.org/process/util;1"]
+          .createInstance(Components.interfaces.nsIProcess);
+        const shell = self.isWindows() ? "cmd.exe" : "/bin/sh";
+        const shellArgs = self.isWindows() ? ["/c", cmd] : ["-c", cmd];
+        const shellFile = Components.classes["@mozilla.org/file/local;1"]
+          .createInstance(Components.interfaces.nsIFile);
+        shellFile.initWithPath(shell);
+        process.init(shellFile);
+        process.run(true, shellArgs, shellArgs.length);
+
+        // Read result
+        setTimeout(async () => {
+          try {
+            const content = await Zotero.File.getContentsAsync(tempFile);
+            const pageCount = parseInt(content.trim(), 10);
+            try { await IOUtils.remove(tempFile); } catch (e) {}
+            resolve(isNaN(pageCount) ? null : pageCount);
+          } catch (e) {
+            resolve(null);
+          }
+        }, 100);
+      } catch (e) {
+        self.log(`Failed to get DJVU page count: ${e.message}`);
+        resolve(null);
+      }
+    });
+  }
+
   async runDdjvuWithProgress(inputPath, outputPath, progress) {
     const self = this;
+
+    // Get page count first for progress display
+    const totalPages = await this.getDjvuPageCount(inputPath);
+    if (totalPages) {
+      this.log(`DJVU has ${totalPages} pages`);
+    }
 
     return new Promise((resolve, reject) => {
       self.log("Starting DJVU conversion...");
@@ -2463,18 +2524,28 @@ class ZoteroDJVUConverter {
       const markerFile = outputPath + ".done";
       const errorFile = outputPath + ".error";
       const pidFile = outputPath + ".pid";
+      const logFile = outputPath + ".log";
 
-      // Build the ddjvu command (cross-platform)
+      // Clean up any leftover files from previous cancelled runs
+      try { await IOUtils.remove(markerFile); } catch (e) {}
+      try { await IOUtils.remove(errorFile); } catch (e) {}
+      try { await IOUtils.remove(logFile); } catch (e) {}
+      try { await IOUtils.remove(pidFile); } catch (e) {}
+      try { await IOUtils.remove(outputPath); } catch (e) {}
+
+      // Build the ddjvu command with -verbose for progress (cross-platform)
       let ddjvuCmd;
       if (self.isWindows()) {
         const escapedInput = self.escapeWindowsPath(inputPath);
         const escapedOutput = self.escapeWindowsPath(outputPath);
         const escapedTool = self.escapeWindowsPath(self.ddjvuPath);
-        ddjvuCmd = `"${escapedTool}" -format=pdf "${escapedInput}" "${escapedOutput}"`;
+        const escapedLog = self.escapeWindowsPath(logFile);
+        ddjvuCmd = `"${escapedTool}" -format=pdf -verbose "${escapedInput}" "${escapedOutput}" 2>"${escapedLog}"`;
       } else {
         const escapedInput = self.escapeShellPath(inputPath);
         const escapedOutput = self.escapeShellPath(outputPath);
-        ddjvuCmd = `"${self.ddjvuPath}" -format=pdf "${escapedInput}" "${escapedOutput}"`;
+        const escapedLog = self.escapeShellPath(logFile);
+        ddjvuCmd = `"${self.ddjvuPath}" -format=pdf -verbose "${escapedInput}" "${escapedOutput}" 2>"${escapedLog}"`;
       }
 
       // Start background process using helper
@@ -2489,6 +2560,7 @@ class ZoteroDJVUConverter {
           await self.killBackgroundProcess(pidFile, "ddjvu");
           try { await IOUtils.remove(markerFile); } catch (e) {}
           try { await IOUtils.remove(errorFile); } catch (e) {}
+          try { await IOUtils.remove(logFile); } catch (e) {}
           try { await IOUtils.remove(outputPath); } catch (e) {}
           self.log("DJVU conversion cancelled");
           reject(new Error("Cancelled by user"));
@@ -2497,7 +2569,27 @@ class ZoteroDJVUConverter {
 
         const elapsed = Date.now() - startTime;
         const elapsedSec = Math.floor(elapsed / 1000);
-        progress.updateText(`Converting DJVU to PDF... ${elapsedSec}s`);
+
+        // Parse log file for page progress
+        let pageInfo = "";
+        try {
+          const logContent = await Zotero.File.getContentsAsync(logFile);
+          // Find all "-------- page N -------" lines
+          const pageMatches = logContent.match(/-------- page (\d+) -------/g);
+          if (pageMatches && pageMatches.length > 0) {
+            const lastMatch = pageMatches[pageMatches.length - 1];
+            const currentPage = lastMatch.match(/page (\d+)/)[1];
+            if (totalPages) {
+              pageInfo = ` • page ${currentPage}/${totalPages}`;
+            } else {
+              pageInfo = ` • page ${currentPage}`;
+            }
+          }
+        } catch (e) {
+          // Log file might not exist yet
+        }
+
+        progress.updateText(`Converting DJVU to PDF${pageInfo} • ${elapsedSec}s`);
 
         let done = false;
         let error = false;
@@ -2509,12 +2601,14 @@ class ZoteroDJVUConverter {
           clearInterval(checkInterval);
           try { await IOUtils.remove(markerFile); } catch (e) {}
           try { await IOUtils.remove(errorFile); } catch (e) {}
+          try { await IOUtils.remove(logFile); } catch (e) {}
           try { await IOUtils.remove(pidFile); } catch (e) {}
           self.log("DJVU conversion complete");
           resolve(true);
         } else if (error) {
           clearInterval(checkInterval);
           try { await IOUtils.remove(errorFile); } catch (e) {}
+          try { await IOUtils.remove(logFile); } catch (e) {}
           try { await IOUtils.remove(pidFile); } catch (e) {}
           self.log("DJVU conversion failed");
           reject(new Error("DJVU conversion failed - check if file is corrupted"));
@@ -2523,6 +2617,7 @@ class ZoteroDJVUConverter {
           await self.killBackgroundProcess(pidFile, "ddjvu");
           try { await IOUtils.remove(markerFile); } catch (e) {}
           try { await IOUtils.remove(errorFile); } catch (e) {}
+          try { await IOUtils.remove(logFile); } catch (e) {}
           self.log("DJVU conversion timeout");
           reject(new Error("DJVU conversion timed out"));
         }
@@ -2540,18 +2635,22 @@ class ZoteroDJVUConverter {
       // Ghostscript compression command (cross-platform)
       // /ebook = 150 dpi, good balance of quality and size
       // /screen = 72 dpi, smallest but lower quality
+      // Note: removed -dQUIET to get page progress output
+      const logFile = compressedPath + ".log";
       let gsCmd;
       if (self.isWindows()) {
         const escapedInput = self.escapeWindowsPath(inputPath);
         const escapedCompressed = self.escapeWindowsPath(compressedPath);
         const escapedTool = self.escapeWindowsPath(self.gsPath);
+        const escapedLog = self.escapeWindowsPath(logFile);
         // On Windows, use gswin64c or gswin32c (console version)
-        gsCmd = `"${escapedTool}" -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/ebook -dNOPAUSE -dQUIET -dBATCH -sOutputFile="${escapedCompressed}" "${escapedInput}"`;
+        gsCmd = `"${escapedTool}" -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/ebook -dNOPAUSE -dBATCH -sOutputFile="${escapedCompressed}" "${escapedInput}" >"${escapedLog}" 2>&1`;
       } else {
         const pathExport = self.getPathExport();
         const escapedInput = self.escapeShellPath(inputPath);
         const escapedCompressed = self.escapeShellPath(compressedPath);
-        gsCmd = `${pathExport} "${self.gsPath}" -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/ebook -dNOPAUSE -dQUIET -dBATCH -sOutputFile="${escapedCompressed}" "${escapedInput}"`;
+        const escapedLog = self.escapeShellPath(logFile);
+        gsCmd = `${pathExport} "${self.gsPath}" -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/ebook -dNOPAUSE -dBATCH -sOutputFile="${escapedCompressed}" "${escapedInput}" >"${escapedLog}" 2>&1`;
       }
 
       self.log(`GS command: ${gsCmd}`);
@@ -2560,12 +2659,20 @@ class ZoteroDJVUConverter {
       const errorFile = compressedPath + ".error";
       const pidFile = compressedPath + ".pid";
 
+      // Clean up any leftover files from previous cancelled runs
+      try { await IOUtils.remove(markerFile); } catch (e) {}
+      try { await IOUtils.remove(errorFile); } catch (e) {}
+      try { await IOUtils.remove(logFile); } catch (e) {}
+      try { await IOUtils.remove(pidFile); } catch (e) {}
+      try { await IOUtils.remove(compressedPath); } catch (e) {}
+
       // Start background process using helper
       self.startBackgroundProcess(gsCmd, markerFile, errorFile, pidFile);
 
       // Poll for completion
       const startTime = Date.now();
       const maxWait = ZoteroDJVUConverter.TIMEOUT_COMPRESSION;
+      let totalPages = null;
 
       const checkInterval = setInterval(async () => {
         // Check if cancelled
@@ -2576,6 +2683,7 @@ class ZoteroDJVUConverter {
           // Clean up files
           try { await IOUtils.remove(markerFile); } catch (e) {}
           try { await IOUtils.remove(errorFile); } catch (e) {}
+          try { await IOUtils.remove(logFile); } catch (e) {}
           try { await IOUtils.remove(compressedPath); } catch (e) {}
           self.log("Compression cancelled by user");
           resolve(false);
@@ -2585,7 +2693,33 @@ class ZoteroDJVUConverter {
         const elapsed = Date.now() - startTime;
         const elapsedSec = Math.floor(elapsed / 1000);
 
-        progress.updateText(`Compressing PDF... ${elapsedSec}s`);
+        // Parse log file for page progress
+        let pageInfo = "";
+        try {
+          const logContent = await Zotero.File.getContentsAsync(logFile);
+          // Parse total pages from "Processing pages 1 through N."
+          if (!totalPages) {
+            const totalMatch = logContent.match(/Processing pages \d+ through (\d+)/);
+            if (totalMatch) {
+              totalPages = parseInt(totalMatch[1], 10);
+            }
+          }
+          // Find last "Page N" line
+          const pageMatches = logContent.match(/^Page (\d+)$/gm);
+          if (pageMatches && pageMatches.length > 0) {
+            const lastMatch = pageMatches[pageMatches.length - 1];
+            const currentPage = lastMatch.match(/Page (\d+)/)[1];
+            if (totalPages) {
+              pageInfo = ` • page ${currentPage}/${totalPages}`;
+            } else {
+              pageInfo = ` • page ${currentPage}`;
+            }
+          }
+        } catch (e) {
+          // Log file might not exist yet
+        }
+
+        progress.updateText(`Compressing PDF${pageInfo} • ${elapsedSec}s`);
 
         let done = false;
         let error = false;
@@ -2597,6 +2731,7 @@ class ZoteroDJVUConverter {
           clearInterval(checkInterval);
           try { await IOUtils.remove(markerFile); } catch (e) {}
           try { await IOUtils.remove(errorFile); } catch (e) {}
+          try { await IOUtils.remove(logFile); } catch (e) {}
           try { await IOUtils.remove(pidFile); } catch (e) {}
 
           // Check if compressed file is smaller
@@ -2625,6 +2760,7 @@ class ZoteroDJVUConverter {
         } else if (error) {
           clearInterval(checkInterval);
           try { await IOUtils.remove(errorFile); } catch (e) {}
+          try { await IOUtils.remove(logFile); } catch (e) {}
           try { await IOUtils.remove(compressedPath); } catch (e) {}
           try { await IOUtils.remove(pidFile); } catch (e) {}
           self.log("PDF compression failed");
@@ -2636,6 +2772,7 @@ class ZoteroDJVUConverter {
           // Clean up marker files on timeout
           try { await IOUtils.remove(markerFile); } catch (e) {}
           try { await IOUtils.remove(errorFile); } catch (e) {}
+          try { await IOUtils.remove(logFile); } catch (e) {}
           try { await IOUtils.remove(compressedPath); } catch (e) {}
           self.log("Compression timeout");
           resolve(false);
