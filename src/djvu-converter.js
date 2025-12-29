@@ -16,13 +16,12 @@ class ZoteroDJVUConverter {
   static MIN_TEXT_CHARS = 50;            // Minimum chars to consider PDF has text
 
   // Compression level mapping to ocrmypdf -O levels
-  // Higher -O = more aggressive compression = smaller files = lower quality
+  // Higher -O = more aggressive compression = smaller files
   static COMPRESSION_LEVELS = {
-    "none": 0,   // No optimization
-    "max": 1,    // Lossless optimization (largest, best quality)
-    "high": 1,   // Lossless optimization
-    "medium": 2, // Lossy optimization (recommended)
-    "low": 3     // Aggressive optimization (smallest, lowest quality)
+    "none": 0,     // No optimization
+    "light": 1,    // Lossless optimization (best quality)
+    "medium": 2,   // Lossy optimization (recommended)
+    "maximum": 3   // Aggressive optimization (smallest file)
   };
 
   // Get ocrmypdf -O level from compression level string
@@ -1119,11 +1118,10 @@ class ZoteroDJVUConverter {
       dialog.appendChild(optimizeLabel);
 
       const optimizeOptions = [
-        { value: "none", label: "None (no compression)" },
-        { value: "low", label: "Low quality (smallest file)" },
-        { value: "medium", label: "Medium quality (recommended)" },
-        { value: "high", label: "High quality" },
-        { value: "max", label: "Maximum quality (largest file)" }
+        { value: "none", label: "None (no optimization)" },
+        { value: "light", label: "Light (lossless, best quality)" },
+        { value: "medium", label: "Medium (recommended)" },
+        { value: "maximum", label: "Maximum (smallest file)" }
       ];
       const optimizeSelect = this.createSelect(doc, optimizeOptions, "medium");
       optimizeSelect.style.marginBottom = "20px";
@@ -1200,10 +1198,9 @@ class ZoteroDJVUConverter {
 
       // Compression level dropdown
       const levels = [
-        { value: "low", label: "Low quality (smallest file)" },
-        { value: "medium", label: "Medium quality (recommended)" },
-        { value: "high", label: "High quality" },
-        { value: "max", label: "Maximum quality (largest file)" }
+        { value: "light", label: "Light (lossless, best quality)" },
+        { value: "medium", label: "Medium (recommended)" },
+        { value: "maximum", label: "Maximum (smallest file)" }
       ];
       const levelSelect = this.createSelect(doc, levels, "medium");
       levelSelect.style.marginBottom = "20px";
@@ -1629,11 +1626,10 @@ class ZoteroDJVUConverter {
       compressContainer.appendChild(compressLevelLabel);
 
       const compressLevels = [
-        { value: "none", label: "None (no compression)" },
-        { value: "low", label: "Low quality (smallest file)" },
-        { value: "medium", label: "Medium quality (recommended)" },
-        { value: "high", label: "High quality" },
-        { value: "max", label: "Maximum quality (largest file)" }
+        { value: "none", label: "None (no optimization)" },
+        { value: "light", label: "Light (lossless, best quality)" },
+        { value: "medium", label: "Medium (recommended)" },
+        { value: "maximum", label: "Maximum (smallest file)" }
       ];
       const compressSelect = this.createSelect(doc, compressLevels, "medium", !compressAvailable);
       compressContainer.appendChild(compressSelect);
