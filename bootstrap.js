@@ -9,50 +9,69 @@ function log(msg) {
 async function startup({ id, version, resourceURI, rootURI }) {
   log(`Starting DJVU Converter v${version}`);
 
-  // Wait for Zotero to be ready
-  await Zotero.uiReadyPromise;
+  try {
+    // Wait for Zotero to be ready
+    await Zotero.uiReadyPromise;
 
-  Services.scriptloader.loadSubScript(rootURI + "src/djvu-converter.js");
+    Services.scriptloader.loadSubScript(rootURI + "src/djvu-converter.js");
 
-  DJVUConverter = new ZoteroDJVUConverter();
-  await DJVUConverter.init();
+    DJVUConverter = new ZoteroDJVUConverter();
+    await DJVUConverter.init();
 
-  // Register notifier immediately on startup
-  DJVUConverter.registerNotifier();
+    // Register notifier immediately on startup
+    DJVUConverter.registerNotifier();
 
-  // Add context menu to existing windows
-  const windows = Zotero.getMainWindows();
-  for (const win of windows) {
-    DJVUConverter.onMainWindowLoad(win);
+    // Add context menu to existing windows
+    const windows = Zotero.getMainWindows();
+    for (const win of windows) {
+      DJVUConverter.onMainWindowLoad(win);
+    }
+
+    log("Startup complete - notifier and context menu registered");
+  } catch (e) {
+    log(`Startup error: ${e.message}`);
+    Zotero.debug(`[DJVU Converter] Startup error stack: ${e.stack}`);
   }
-
-  log("Startup complete - notifier and context menu registered");
 }
 
 function shutdown({ id, version, resourceURI, rootURI }, reason) {
   log("Shutting down DJVU Converter");
 
-  if (DJVUConverter) {
-    // Remove context menu from all windows
-    const windows = Zotero.getMainWindows();
-    for (const win of windows) {
-      DJVUConverter.onMainWindowUnload(win);
+  try {
+    if (DJVUConverter) {
+      // Remove context menu from all windows
+      const windows = Zotero.getMainWindows();
+      for (const win of windows) {
+        try {
+          DJVUConverter.onMainWindowUnload(win);
+        } catch (e) {
+          log(`Error unloading window: ${e.message}`);
+        }
+      }
+      DJVUConverter.shutdown();
+      DJVUConverter = null;
     }
-    DJVUConverter.shutdown();
-    DJVUConverter = null;
+  } catch (e) {
+    log(`Shutdown error: ${e.message}`);
   }
 }
 
 function onMainWindowLoad({ window }) {
-  log("Main window loaded");
-  if (DJVUConverter) {
-    DJVUConverter.onMainWindowLoad(window);
+  try {
+    if (DJVUConverter) {
+      DJVUConverter.onMainWindowLoad(window);
+    }
+  } catch (e) {
+    log(`Window load error: ${e.message}`);
   }
 }
 
 function onMainWindowUnload({ window }) {
-  log("Main window unloaded");
-  if (DJVUConverter) {
-    DJVUConverter.onMainWindowUnload(window);
+  try {
+    if (DJVUConverter) {
+      DJVUConverter.onMainWindowUnload(window);
+    }
+  } catch (e) {
+    log(`Window unload error: ${e.message}`);
   }
 }

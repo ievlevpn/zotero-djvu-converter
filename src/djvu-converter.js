@@ -482,29 +482,33 @@ class ZoteroDJVUConverter {
   async init() {
     this.log("Initializing...");
 
-    // Find tools using `which` command
-    this.ddjvuPath = await this.findExecutable("ddjvu");
-    this.ddjvuFound = !!this.ddjvuPath;
-    if (this.ddjvuFound) this.log(`Found ddjvu at: ${this.ddjvuPath}`);
+    try {
+      // Find tools using `which` command
+      this.ddjvuPath = await this.findExecutable("ddjvu");
+      this.ddjvuFound = !!this.ddjvuPath;
+      if (this.ddjvuFound) this.log(`Found ddjvu at: ${this.ddjvuPath}`);
 
-    this.ocrmypdfPath = await this.findExecutable("ocrmypdf");
-    this.ocrmypdfFound = !!this.ocrmypdfPath;
-    if (this.ocrmypdfFound) this.log(`Found ocrmypdf at: ${this.ocrmypdfPath}`);
+      this.ocrmypdfPath = await this.findExecutable("ocrmypdf");
+      this.ocrmypdfFound = !!this.ocrmypdfPath;
+      if (this.ocrmypdfFound) this.log(`Found ocrmypdf at: ${this.ocrmypdfPath}`);
 
-    const tesseractPath = await this.findExecutable("tesseract");
-    this.tesseractFound = !!tesseractPath;
-    if (this.tesseractFound) this.log(`Found tesseract at: ${tesseractPath}`);
+      const tesseractPath = await this.findExecutable("tesseract");
+      this.tesseractFound = !!tesseractPath;
+      if (this.tesseractFound) this.log(`Found tesseract at: ${tesseractPath}`);
 
-    // Also check for pdftotext (used for checking existing OCR)
-    this.pdftotextPath = await this.findExecutable("pdftotext");
-    if (this.pdftotextPath) this.log(`Found pdftotext at: ${this.pdftotextPath}`);
+      // Also check for pdftotext (used for checking existing OCR)
+      this.pdftotextPath = await this.findExecutable("pdftotext");
+      if (this.pdftotextPath) this.log(`Found pdftotext at: ${this.pdftotextPath}`);
 
-    // Also check for pdfinfo (used for page count)
-    this.pdfinfoPath = await this.findExecutable("pdfinfo");
-    if (this.pdfinfoPath) this.log(`Found pdfinfo at: ${this.pdfinfoPath}`);
+      // Also check for pdfinfo (used for page count)
+      this.pdfinfoPath = await this.findExecutable("pdfinfo");
+      if (this.pdfinfoPath) this.log(`Found pdfinfo at: ${this.pdfinfoPath}`);
 
-    // Show dependency check popup
-    this.showDependencyCheck();
+      // Show dependency check popup
+      this.showDependencyCheck();
+    } catch (e) {
+      this.log(`Init error: ${e.message}`);
+    }
   }
 
   // Get page count from PDF using pdfinfo
