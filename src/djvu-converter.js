@@ -270,9 +270,11 @@ class ZoteroDJVUConverter {
   // filterFn receives (item) and should return true to include the attachment
   collectAttachments(items, filterFn) {
     const results = [];
+    const seenIds = new Set();
 
     const checkItem = (item) => {
-      if (item.isAttachment() && !item.deleted && filterFn(item)) {
+      if (item.isAttachment() && !item.deleted && filterFn(item) && !seenIds.has(item.id)) {
+        seenIds.add(item.id);
         results.push(item);
       }
     };
@@ -713,7 +715,7 @@ class ZoteroDJVUConverter {
 
     // Helper to check attachment type
     const checkAttachment = (item) => {
-      if (!item.isAttachment()) return;
+      if (!item.isAttachment() || item.deleted) return;
       const contentType = item.attachmentContentType;
       const filename = item.attachmentFilename || "";
       const lowerName = filename.toLowerCase();
@@ -727,6 +729,7 @@ class ZoteroDJVUConverter {
     };
 
     for (const item of items) {
+      if (item.deleted) continue;
       if (item.isAttachment()) {
         checkAttachment(item);
       } else {
@@ -1496,14 +1499,22 @@ class ZoteroDJVUConverter {
       dialog.appendChild(optLabel);
 
       // OCR checkbox
+      const ocrAvailable = self.ocrmypdfFound && self.tesseractFound;
       const ocrLabel = doc.createElement("label");
-      ocrLabel.style.cssText = "display: flex; align-items: center; margin-bottom: 8px; cursor: pointer;";
+      ocrLabel.style.cssText = `display: flex; align-items: center; margin-bottom: 8px; cursor: ${ocrAvailable ? "pointer" : "default"};`;
       const ocrCheck = doc.createElement("input");
       ocrCheck.type = "checkbox";
       ocrCheck.id = "djvu-ocr";
+      ocrCheck.disabled = !ocrAvailable;
       ocrCheck.style.cssText = "margin-right: 8px; width: 16px; height: 16px;";
       ocrLabel.appendChild(ocrCheck);
-      ocrLabel.appendChild(doc.createTextNode("Add OCR text layer (makes PDF searchable)"));
+      const ocrText = ocrAvailable
+        ? "Add OCR text layer (makes PDF searchable)"
+        : "Add OCR text layer (not available - install ocrmypdf + tesseract)";
+      ocrLabel.appendChild(doc.createTextNode(ocrText));
+      if (!ocrAvailable) {
+        ocrLabel.style.color = "#999";
+      }
       dialog.appendChild(ocrLabel);
 
       // OCR Languages container (hidden initially)
@@ -1555,15 +1566,23 @@ class ZoteroDJVUConverter {
       });
 
       // Compress checkbox
+      const compressAvailable = self.gsFound;
       const compressLabel = doc.createElement("label");
-      compressLabel.style.cssText = "display: flex; align-items: center; margin-bottom: 20px; cursor: pointer;";
+      compressLabel.style.cssText = `display: flex; align-items: center; margin-bottom: 20px; cursor: ${compressAvailable ? "pointer" : "default"};`;
       const compressCheck = doc.createElement("input");
       compressCheck.type = "checkbox";
       compressCheck.id = "djvu-compress";
-      compressCheck.checked = true;
+      compressCheck.checked = compressAvailable;
+      compressCheck.disabled = !compressAvailable;
       compressCheck.style.cssText = "margin-right: 8px; width: 16px; height: 16px;";
       compressLabel.appendChild(compressCheck);
-      compressLabel.appendChild(doc.createTextNode("Compress PDF (smaller file size)"));
+      const compressText = compressAvailable
+        ? "Compress PDF (smaller file size)"
+        : "Compress PDF (not available - install ghostscript)";
+      compressLabel.appendChild(doc.createTextNode(compressText));
+      if (!compressAvailable) {
+        compressLabel.style.color = "#999";
+      }
       dialog.appendChild(compressLabel);
 
       // After conversion label
