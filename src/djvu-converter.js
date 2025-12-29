@@ -1,4 +1,21 @@
 class ZoteroDJVUConverter {
+  // Timeouts (in milliseconds)
+  static TIMEOUT_OCR = 600000;           // 10 minutes for OCR
+  static TIMEOUT_CONVERSION = 300000;    // 5 minutes for DJVU conversion
+  static TIMEOUT_COMPRESSION = 300000;   // 5 minutes for PDF compression
+
+  // Polling intervals (in milliseconds)
+  static POLL_INTERVAL_FAST = 500;       // For conversion/compression
+  static POLL_INTERVAL_SLOW = 1000;      // For OCR (less frequent)
+
+  // OCR settings
+  static OCR_SKIP_BIG_MB = 50;           // Skip images larger than 50MB
+  static OCR_TESSERACT_TIMEOUT = 180;    // Tesseract timeout per page (seconds)
+
+  // UI settings
+  static PROGRESS_CLOSE_DELAY = 4000;    // Auto-close progress after success (ms)
+  static MIN_TEXT_CHARS = 50;            // Minimum chars to consider PDF has text
+
   constructor() {
     this.notifierID = null;
     this.ddjvuPath = null;
@@ -38,8 +55,27 @@ class ZoteroDJVUConverter {
     } else if (os === "WINNT") {
       // Windows: Common paths (requires tools installed via Chocolatey, Scoop, etc.)
       paths.push("C:\\Program Files\\DjVuLibre");
-      paths.push("C:\\Program Files\\gs\\gs10.02.1\\bin"); // Ghostscript
       paths.push("C:\\Program Files\\Tesseract-OCR");
+      // Ghostscript: search for any version in Program Files
+      try {
+        const gsBaseDir = "C:\\Program Files\\gs";
+        const gsDir = Zotero.File.pathToFile(gsBaseDir);
+        if (gsDir.exists() && gsDir.isDirectory()) {
+          const entries = gsDir.directoryEntries;
+          while (entries.hasMoreElements()) {
+            const entry = entries.getNext().QueryInterface(Ci.nsIFile);
+            if (entry.isDirectory() && entry.leafName.startsWith("gs")) {
+              paths.push(PathUtils.join(entry.path, "bin"));
+            }
+          }
+        }
+      } catch (e) {
+        // Fallback to common version paths if directory enumeration fails
+        paths.push("C:\\Program Files\\gs\\gs10.03.0\\bin");
+        paths.push("C:\\Program Files\\gs\\gs10.02.1\\bin");
+        paths.push("C:\\Program Files\\gs\\gs10.01.0\\bin");
+        paths.push("C:\\Program Files\\gs\\gs9.56.1\\bin");
+      }
       try {
         const home = Services.dirsvc.get("Home", Ci.nsIFile).path;
         paths.push(PathUtils.join(home, "scoop", "shims")); // Scoop
@@ -63,6 +99,14 @@ class ZoteroDJVUConverter {
   // Check if running on Windows
   isWindows() {
     return Services.appinfo.OS === "WINNT";
+  }
+
+  // Get filename from path (cross-platform)
+  getBasename(filePath) {
+    if (!filePath) return '';
+    // Handle both Unix (/) and Windows (\) separators
+    const lastSlash = Math.max(filePath.lastIndexOf('/'), filePath.lastIndexOf('\\'));
+    return lastSlash >= 0 ? filePath.substring(lastSlash + 1) : filePath;
   }
 
   // Get platform-specific install instructions for a package
@@ -104,18 +148,99 @@ class ZoteroDJVUConverter {
     return (bytes / (1024 * 1024)).toFixed(1) + " MB";
   }
 
-  // Get shell executable and args for cross-platform command execution
-  getShellCommand(cmd) {
+  // Build a background command that creates marker files on success/error
+  // Returns the full command string for the current platform
+  buildBackgroundCommand(cmd, markerFile, errorFile, pidFile) {
     if (this.isWindows()) {
-      return { shell: "cmd.exe", args: ["/c", cmd] };
+      // Windows: Use cmd.exe with conditional execution
+      // Note: Windows cmd doesn't support easy PID capture, so we skip pidFile
+      const escapedMarker = this.escapeWindowsPath(markerFile);
+      const escapedError = this.escapeWindowsPath(errorFile);
+      // Use copy nul to create empty files (Windows touch equivalent)
+      // && runs next command only if previous succeeds, || runs if it fails
+      return `(${cmd}) && (copy nul "${escapedMarker}" >nul 2>&1) || (copy nul "${escapedError}" >nul 2>&1)`;
+    } else {
+      // Unix: Use shell with touch and background execution
+      const escapedMarker = this.escapeShellPath(markerFile);
+      const escapedError = this.escapeShellPath(errorFile);
+      const escapedPid = this.escapeShellPath(pidFile);
+      return `(${cmd} && touch "${escapedMarker}") || (touch "${escapedError}") & echo $! > "${escapedPid}"`;
     }
-    return { shell: "/bin/sh", args: ["-c", cmd] };
   }
 
-  // Execute a shell command cross-platform
-  async execShellCommand(cmd) {
-    const { shell, args } = this.getShellCommand(cmd);
-    return Zotero.Utilities.Internal.exec(shell, args);
+  // Start a background process
+  async startBackgroundProcess(cmd, markerFile, errorFile, pidFile) {
+    const fullCmd = this.buildBackgroundCommand(cmd, markerFile, errorFile, pidFile);
+
+    if (this.isWindows()) {
+      // Windows: Use start /B for background execution
+      // Pass command directly - the buildBackgroundCommand already handles escaping
+      // Using start /B without extra quoting wrapper to avoid escaping conflicts
+      Zotero.Utilities.Internal.exec("cmd.exe", ["/c", `start /B cmd /c ${fullCmd}`]).catch(e => {
+        this.log(`Background start error: ${e.message}`);
+      });
+    } else {
+      // Unix: The command already includes & for background
+      Zotero.Utilities.Internal.exec("/bin/sh", ["-c", fullCmd]).catch(e => {
+        this.log(`Background start error: ${e.message}`);
+      });
+    }
+  }
+
+  // Kill a background process by PID file (Unix) or by pattern (Windows)
+  async killBackgroundProcess(pidFile, processPattern) {
+    if (this.isWindows()) {
+      // Windows: Try to kill by process name pattern
+      if (processPattern) {
+        try {
+          // Use taskkill to kill processes matching the pattern
+          // /F = force, /IM = image name (must include .exe)
+          // Handle special cases for different executables
+          const patterns = [];
+          if (processPattern === "gs") {
+            // Ghostscript on Windows has different names
+            patterns.push("gswin64c.exe", "gswin32c.exe", "gs.exe");
+          } else if (processPattern === "ocrmypdf") {
+            // ocrmypdf runs via Python on Windows
+            patterns.push("ocrmypdf.exe");
+            // Note: We don't kill python.exe as it might affect other processes
+          } else {
+            // Add .exe if not already present
+            const exeName = processPattern.endsWith(".exe") ? processPattern : `${processPattern}.exe`;
+            patterns.push(exeName);
+          }
+
+          for (const pattern of patterns) {
+            try {
+              await Zotero.Utilities.Internal.exec("cmd.exe", ["/c",
+                `taskkill /F /IM "${pattern}" 2>nul`
+              ]);
+            } catch (e) {
+              // Process might not exist or already be dead
+            }
+          }
+        } catch (e) {
+          // Process might already be dead
+        }
+      }
+    } else {
+      // Unix: Kill by PID from file
+      try {
+        const pidContent = await Zotero.File.getContentsAsync(pidFile);
+        const pid = parseInt(pidContent.trim(), 10);
+        if (pid > 0) {
+          this.log(`Killing process with PID: ${pid}`);
+          // Kill the process group to ensure child processes are also killed
+          await Zotero.Utilities.Internal.exec("/bin/sh", ["-c",
+            `kill -TERM -${pid} 2>/dev/null || kill -TERM ${pid} 2>/dev/null || true`
+          ]);
+        }
+      } catch (e) {
+        this.log(`Could not kill process: ${e.message}`);
+      }
+    }
+    // Clean up PID file
+    try { await IOUtils.remove(pidFile); } catch (e) {}
   }
 
   // Supported OCR languages
@@ -139,6 +264,35 @@ class ZoteroDJVUConverter {
   log(msg) {
     Zotero.debug(`[DJVU Converter] ${msg}`);
     dump(`[DJVU Converter] ${msg}\n`);
+  }
+
+  // Collect attachments from selected items that match a filter function
+  // filterFn receives (item) and should return true to include the attachment
+  collectAttachments(items, filterFn) {
+    const results = [];
+
+    const checkItem = (item) => {
+      if (item.isAttachment() && !item.deleted && filterFn(item)) {
+        results.push(item);
+      }
+    };
+
+    for (const item of items) {
+      if (item.isAttachment() && !item.deleted) {
+        checkItem(item);
+      } else if (!item.deleted) {
+        // Check child attachments of parent items
+        const attachmentIDs = item.getAttachments();
+        for (const attID of attachmentIDs) {
+          const attachment = Zotero.Items.get(attID);
+          if (attachment) {
+            checkItem(attachment);
+          }
+        }
+      }
+    }
+
+    return results;
   }
 
   // Truncate long filenames for display in dialogs
@@ -200,7 +354,15 @@ class ZoteroDJVUConverter {
     this.tesseractFound = !!tesseractPath;
     if (this.tesseractFound) this.log(`Found tesseract at: ${tesseractPath}`);
 
-    this.gsPath = await this.findExecutable("gs");
+    // Ghostscript: try platform-specific names
+    // On Windows it's gswin64c or gswin32c, on Unix it's gs
+    if (this.isWindows()) {
+      this.gsPath = await this.findExecutable("gswin64c") ||
+                    await this.findExecutable("gswin32c") ||
+                    await this.findExecutable("gs");
+    } else {
+      this.gsPath = await this.findExecutable("gs");
+    }
     this.gsFound = !!this.gsPath;
     if (this.gsFound) this.log(`Found ghostscript at: ${this.gsPath}`);
 
@@ -227,9 +389,10 @@ class ZoteroDJVUConverter {
 
       if (this.isWindows()) {
         // Windows: use findstr instead of grep
+        const escapedToolWin = this.escapeWindowsPath(this.pdfinfoPath);
         const escapedPdfWin = this.escapeWindowsPath(pdfPath);
         const escapedTempWin = this.escapeWindowsPath(tempFile);
-        const cmd = `"${this.pdfinfoPath}" "${escapedPdfWin}" 2>nul | findstr /i "^Pages:" > "${escapedTempWin}"`;
+        const cmd = `"${escapedToolWin}" "${escapedPdfWin}" 2>nul | findstr /i "^Pages:" > "${escapedTempWin}"`;
         await Zotero.Utilities.Internal.exec("cmd.exe", ["/c", cmd]);
       } else {
         await Zotero.Utilities.Internal.exec("/bin/sh", ["-c",
@@ -269,14 +432,18 @@ class ZoteroDJVUConverter {
         const escapedTempFile = tempFile.replace(/\\/g, "\\\\");
 
         // First check if executable exists in known paths
+        // Check multiple extensions: .exe, .bat, .cmd, and no extension (for scripts)
         const searchPaths = this.getSearchPaths();
+        const extensions = [".exe", ".bat", ".cmd", ""];
         for (const dir of searchPaths) {
-          const exePath = PathUtils.join(dir, name + ".exe");
-          try {
-            if (await IOUtils.exists(exePath)) {
-              return exePath;
-            }
-          } catch (e) {}
+          for (const ext of extensions) {
+            const exePath = PathUtils.join(dir, name + ext);
+            try {
+              if (await IOUtils.exists(exePath)) {
+                return exePath;
+              }
+            } catch (e) {}
+          }
         }
 
         // Fall back to 'where' command
@@ -608,34 +775,11 @@ class ZoteroDJVUConverter {
       return;
     }
 
-    // Collect all DJVU attachments (NOT PDFs, NOT in trash)
-    const djvuItems = [];
-
-    const checkItem = (item) => {
-      if (item.isAttachment() && !item.deleted) {
-        const filename = item.attachmentFilename || "";
-        const lowerName = filename.toLowerCase();
-        // Only DJVU files, not PDFs
-        if (lowerName.endsWith(".djvu") || lowerName.endsWith(".djv")) {
-          djvuItems.push(item);
-        }
-      }
-    };
-
-    for (const item of items) {
-      if (item.isAttachment() && !item.deleted) {
-        checkItem(item);
-      } else if (!item.deleted) {
-        // Check child attachments
-        const attachmentIDs = item.getAttachments();
-        for (const attID of attachmentIDs) {
-          const attachment = Zotero.Items.get(attID);
-          if (attachment) {
-            checkItem(attachment);
-          }
-        }
-      }
-    }
+    // Collect all DJVU attachments
+    const djvuItems = this.collectAttachments(items, (item) => {
+      const filename = (item.attachmentFilename || "").toLowerCase();
+      return filename.endsWith(".djvu") || filename.endsWith(".djv");
+    });
 
     // Check if any DJVU files found
     if (djvuItems.length === 0) {
@@ -678,33 +822,12 @@ class ZoteroDJVUConverter {
       return;
     }
 
-    // Collect all PDF attachments (NOT in trash)
-    const pdfItems = [];
-
-    const checkItem = (item) => {
-      if (item.isAttachment() && !item.deleted) {
-        const contentType = item.attachmentContentType;
-        const filename = item.attachmentFilename || "";
-        if (contentType === "application/pdf" || filename.toLowerCase().endsWith(".pdf")) {
-          pdfItems.push(item);
-        }
-      }
-    };
-
-    for (const item of items) {
-      if (item.isAttachment() && !item.deleted) {
-        checkItem(item);
-      } else if (!item.deleted) {
-        // Check child attachments
-        const attachmentIDs = item.getAttachments();
-        for (const attID of attachmentIDs) {
-          const attachment = Zotero.Items.get(attID);
-          if (attachment) {
-            checkItem(attachment);
-          }
-        }
-      }
-    }
+    // Collect all PDF attachments
+    const pdfItems = this.collectAttachments(items, (item) => {
+      const contentType = item.attachmentContentType;
+      const filename = (item.attachmentFilename || "").toLowerCase();
+      return contentType === "application/pdf" || filename.endsWith(".pdf");
+    });
 
     // Check if any PDF files found
     if (pdfItems.length === 0) {
@@ -741,33 +864,12 @@ class ZoteroDJVUConverter {
       return;
     }
 
-    // Collect all PDF attachments (NOT in trash)
-    const pdfItems = [];
-
-    const checkItem = (item) => {
-      if (item.isAttachment() && !item.deleted) {
-        const contentType = item.attachmentContentType;
-        const filename = item.attachmentFilename || "";
-        if (contentType === "application/pdf" || filename.toLowerCase().endsWith(".pdf")) {
-          pdfItems.push(item);
-        }
-      }
-    };
-
-    for (const item of items) {
-      if (item.isAttachment() && !item.deleted) {
-        checkItem(item);
-      } else if (!item.deleted) {
-        // Check child attachments
-        const attachmentIDs = item.getAttachments();
-        for (const attID of attachmentIDs) {
-          const attachment = Zotero.Items.get(attID);
-          if (attachment) {
-            checkItem(attachment);
-          }
-        }
-      }
-    }
+    // Collect all PDF attachments
+    const pdfItems = this.collectAttachments(items, (item) => {
+      const contentType = item.attachmentContentType;
+      const filename = (item.attachmentFilename || "").toLowerCase();
+      return contentType === "application/pdf" || filename.endsWith(".pdf");
+    });
 
     // Check if any PDF files found
     if (pdfItems.length === 0) {
@@ -800,9 +902,10 @@ class ZoteroDJVUConverter {
       const escapedTxt = this.escapeShellPath(tempTextFile);
 
       if (this.isWindows()) {
+        const escapedToolWin = this.escapeWindowsPath(this.pdftotextPath);
         const escapedPdfWin = this.escapeWindowsPath(filePath);
         const escapedTxtWin = this.escapeWindowsPath(tempTextFile);
-        const cmd = `"${this.pdftotextPath}" -f 1 -l 3 "${escapedPdfWin}" "${escapedTxtWin}" 2>nul`;
+        const cmd = `"${escapedToolWin}" -f 1 -l 3 "${escapedPdfWin}" "${escapedTxtWin}" 2>nul`;
         await Zotero.Utilities.Internal.exec("cmd.exe", ["/c", cmd]);
       } else {
         const cmd = `"${this.pdftotextPath}" -f 1 -l 3 "${escapedPdf}" "${escapedTxt}" 2>/dev/null`;
@@ -818,7 +921,7 @@ class ZoteroDJVUConverter {
         const textContent = await Zotero.File.getContentsAsync(tempTextFile);
         // Check if there's meaningful text (more than just whitespace)
         const cleanedText = textContent.replace(/\s+/g, '').trim();
-        hasText = cleanedText.length > 50; // More than 50 non-whitespace chars
+        hasText = cleanedText.length > ZoteroDJVUConverter.MIN_TEXT_CHARS;
         this.log(`PDF text check: ${cleanedText.length} chars found, hasText=${hasText}`);
       } catch (e) {
         this.log(`Could not read text file: ${e.message}`);
@@ -1076,7 +1179,7 @@ class ZoteroDJVUConverter {
       return;
     }
 
-    const filename = item.getField("title") || filePath.split("/").pop() || "file.pdf";
+    const filename = item.getField("title") || this.getBasename(filePath) || "file.pdf";
 
     // Check if PDF already has text/OCR
     const hasExistingText = await this.checkPdfHasText(filePath);
@@ -1208,7 +1311,7 @@ class ZoteroDJVUConverter {
       return;
     }
 
-    const filename = item.getField("title") || filePath.split("/").pop();
+    const filename = item.getField("title") || this.getBasename(filePath);
 
     // Get original size
     let inputSize = 0;
@@ -1630,7 +1733,7 @@ class ZoteroDJVUConverter {
             progress.setError();
             progress.setText(msg || "Failed");
           }
-          progressWin.startCloseTimer(4000);
+          progressWin.startCloseTimer(ZoteroDJVUConverter.PROGRESS_CLOSE_DELAY);
         },
         close: () => {
           progressWin.close();
@@ -1808,7 +1911,7 @@ class ZoteroDJVUConverter {
       return;
     }
 
-    const filename = item.getField("title") || filePath.split("/").pop() || "file.djvu";
+    const filename = item.getField("title") || this.getBasename(filePath) || "file.djvu";
     this.log(`DJVU file detected: ${filename}`);
 
     // Check if ddjvu is available
@@ -2119,7 +2222,7 @@ class ZoteroDJVUConverter {
 
     // Get original file path and new PDF filename
     const originalPath = await item.getFilePathAsync();
-    const originalFilename = originalPath.split("/").pop();
+    const originalFilename = this.getBasename(originalPath);
     const pdfFilename = originalFilename.replace(/\.(djvu|djv)$/i, ".pdf");
     const destPath = PathUtils.join(storagePath, pdfFilename);
 
@@ -2177,20 +2280,15 @@ class ZoteroDJVUConverter {
       self.log("Starting OCR process...");
       self.log(`OCR languages: ${languages}, pages: ${pageCount || "unknown"}`);
 
-      // Build the shell command with error capture
+      // Build the shell command with error capture (cross-platform)
       // -O 1 = fast optimization
       // --skip-text = skip pages with text (normal mode)
       // --force-ocr = redo OCR even if text exists (force mode)
       // --verbose = output progress info for page tracking
       const errorLogFile = outputPath + ".log";
       const pidFile = outputPath + ".pid";
-      const pathExport = self.getPathExport();
-
-      // Escape paths for shell
-      const escapedInput = self.escapeShellPath(inputPath);
-      const escapedOutput = self.escapeShellPath(outputPath);
-      const escapedLogFile = self.escapeShellPath(errorLogFile);
-      const escapedPidFile = self.escapeShellPath(pidFile);
+      const markerFile = outputPath + ".done";
+      const errorFile = outputPath + ".error";
 
       // Validate language string (only allow alphanumeric, underscore, plus)
       let safeLangs = (languages || 'eng').replace(/[^a-zA-Z0-9_+]/g, '');
@@ -2202,53 +2300,47 @@ class ZoteroDJVUConverter {
       // Use --force-ocr to redo OCR, or --skip-text to skip existing text
       // Use --verbose to get page-by-page progress in log
       const ocrMode = forceOcr ? "--force-ocr" : "--skip-text";
-      const cmd = `${pathExport} "${self.ocrmypdfPath}" -O 1 ${ocrMode} --skip-big 50 --tesseract-timeout 180 --verbose -l ${safeLangs} "${escapedInput}" "${escapedOutput}" 2>"${escapedLogFile}"`;
 
-      self.log(`OCR command: ${cmd}`);
+      // Build command (cross-platform)
+      const skipBig = ZoteroDJVUConverter.OCR_SKIP_BIG_MB;
+      const tessTimeout = ZoteroDJVUConverter.OCR_TESSERACT_TIMEOUT;
+      let ocrCmd;
+      if (self.isWindows()) {
+        const escapedInput = self.escapeWindowsPath(inputPath);
+        const escapedOutput = self.escapeWindowsPath(outputPath);
+        const escapedLogFile = self.escapeWindowsPath(errorLogFile);
+        const escapedTool = self.escapeWindowsPath(self.ocrmypdfPath);
+        // On Windows, ocrmypdf is typically a Python script
+        ocrCmd = `"${escapedTool}" -O 1 ${ocrMode} --skip-big ${skipBig} --tesseract-timeout ${tessTimeout} --verbose -l ${safeLangs} "${escapedInput}" "${escapedOutput}" 2>"${escapedLogFile}"`;
+      } else {
+        const pathExport = self.getPathExport();
+        const escapedInput = self.escapeShellPath(inputPath);
+        const escapedOutput = self.escapeShellPath(outputPath);
+        const escapedLogFile = self.escapeShellPath(errorLogFile);
+        ocrCmd = `${pathExport} "${self.ocrmypdfPath}" -O 1 ${ocrMode} --skip-big ${skipBig} --tesseract-timeout ${tessTimeout} --verbose -l ${safeLangs} "${escapedInput}" "${escapedOutput}" 2>"${escapedLogFile}"`;
+      }
 
-      // Create a marker file to track completion
-      const markerFile = outputPath + ".done";
-      const errorFile = outputPath + ".error";
-      const escapedMarker = self.escapeShellPath(markerFile);
-      const escapedError = self.escapeShellPath(errorFile);
+      self.log(`OCR command: ${ocrCmd}`);
 
-      // Run OCR in background via shell, saving PID for cancellation
-      // The subshell runs the command and we capture its PID
-      const fullCmd = `(${cmd} && touch "${escapedMarker}") || (touch "${escapedError}") & echo $! > "${escapedPidFile}"`;
-
-      // Start the background process (non-blocking)
-      Zotero.Utilities.Internal.exec("/bin/sh", ["-c", fullCmd]).catch(e => {
-        self.log(`OCR background start error: ${e.message}`);
-      });
-
-      // Helper to kill process by PID
-      const killProcess = async () => {
-        try {
-          const pidContent = await Zotero.File.getContentsAsync(pidFile);
-          const pid = parseInt(pidContent.trim(), 10);
-          if (pid > 0) {
-            self.log(`Killing OCR process with PID: ${pid}`);
-            // Kill the process group to ensure child processes are also killed
-            await Zotero.Utilities.Internal.exec("/bin/sh", ["-c", `kill -TERM -${pid} 2>/dev/null || kill -TERM ${pid} 2>/dev/null || true`]);
-            // Also try to kill any ocrmypdf/tesseract processes that might be orphaned
-            await Zotero.Utilities.Internal.exec("/bin/sh", ["-c", `pkill -f "ocrmypdf.*${self.escapeShellPath(outputPath)}" 2>/dev/null || true`]);
-          }
-        } catch (e) {
-          self.log(`Could not kill process: ${e.message}`);
-        }
-        try { await IOUtils.remove(pidFile); } catch (e) {}
-      };
+      // Start background process using helper
+      self.startBackgroundProcess(ocrCmd, markerFile, errorFile, pidFile);
 
       // Poll for completion with progress updates
       const startTime = Date.now();
-      const maxWait = 600000; // 10 minutes max
+      const maxWait = ZoteroDJVUConverter.TIMEOUT_OCR;
 
       const checkInterval = setInterval(async () => {
         // Check if cancelled
         if (progress.cancelled) {
           clearInterval(checkInterval);
           // Kill the background process
-          await killProcess();
+          await self.killBackgroundProcess(pidFile, "ocrmypdf");
+          // Also try to kill tesseract on Windows
+          if (self.isWindows()) {
+            try {
+              await Zotero.Utilities.Internal.exec("cmd.exe", ["/c", "taskkill /F /IM tesseract.exe 2>nul"]);
+            } catch (e) {}
+          }
           // Clean up marker files
           try { await IOUtils.remove(markerFile); } catch (e) {}
           try { await IOUtils.remove(errorFile); } catch (e) {}
@@ -2292,13 +2384,8 @@ class ZoteroDJVUConverter {
         let done = false;
         let error = false;
 
-        try {
-          done = Zotero.File.pathToFile(markerFile).exists();
-        } catch (e) {}
-
-        try {
-          error = Zotero.File.pathToFile(errorFile).exists();
-        } catch (e) {}
+        try { done = await IOUtils.exists(markerFile); } catch (e) {}
+        try { error = await IOUtils.exists(errorFile); } catch (e) {}
 
         if (done) {
           clearInterval(checkInterval);
@@ -2330,7 +2417,13 @@ class ZoteroDJVUConverter {
         } else if (elapsed >= maxWait) {
           clearInterval(checkInterval);
           // Kill the process on timeout
-          await killProcess();
+          await self.killBackgroundProcess(pidFile, "ocrmypdf");
+          // Also try to kill tesseract on Windows
+          if (self.isWindows()) {
+            try {
+              await Zotero.Utilities.Internal.exec("cmd.exe", ["/c", "taskkill /F /IM tesseract.exe 2>nul"]);
+            } catch (e) {}
+          }
           // Clean up all marker files on timeout
           try { await IOUtils.remove(markerFile); } catch (e) {}
           try { await IOUtils.remove(errorFile); } catch (e) {}
@@ -2338,7 +2431,7 @@ class ZoteroDJVUConverter {
           self.log(`OCR timeout after ${elapsedSec} seconds`);
           reject(new Error("OCR timed out after 10 minutes"));
         }
-      }, 1000);
+      }, ZoteroDJVUConverter.POLL_INTERVAL_SLOW);
     });
   }
 
@@ -2352,39 +2445,29 @@ class ZoteroDJVUConverter {
       const errorFile = outputPath + ".error";
       const pidFile = outputPath + ".pid";
 
-      const escapedInput = self.escapeShellPath(inputPath);
-      const escapedOutput = self.escapeShellPath(outputPath);
-      const escapedMarker = self.escapeShellPath(markerFile);
-      const escapedError = self.escapeShellPath(errorFile);
-      const escapedPidFile = self.escapeShellPath(pidFile);
+      // Build the ddjvu command (cross-platform)
+      let ddjvuCmd;
+      if (self.isWindows()) {
+        const escapedInput = self.escapeWindowsPath(inputPath);
+        const escapedOutput = self.escapeWindowsPath(outputPath);
+        const escapedTool = self.escapeWindowsPath(self.ddjvuPath);
+        ddjvuCmd = `"${escapedTool}" -format=pdf "${escapedInput}" "${escapedOutput}"`;
+      } else {
+        const escapedInput = self.escapeShellPath(inputPath);
+        const escapedOutput = self.escapeShellPath(outputPath);
+        ddjvuCmd = `"${self.ddjvuPath}" -format=pdf "${escapedInput}" "${escapedOutput}"`;
+      }
 
-      // Run ddjvu in background
-      const cmd = `("${self.ddjvuPath}" -format=pdf "${escapedInput}" "${escapedOutput}" && touch "${escapedMarker}") || touch "${escapedError}" & echo $! > "${escapedPidFile}"`;
-
-      Zotero.Utilities.Internal.exec("/bin/sh", ["-c", cmd]).catch(e => {
-        self.log(`DJVU background start error: ${e.message}`);
-      });
-
-      // Helper to kill process
-      const killProcess = async () => {
-        try {
-          const pidContent = await Zotero.File.getContentsAsync(pidFile);
-          const pid = parseInt(pidContent.trim(), 10);
-          if (pid > 0) {
-            self.log(`Killing DJVU process with PID: ${pid}`);
-            await Zotero.Utilities.Internal.exec("/bin/sh", ["-c", `kill -TERM -${pid} 2>/dev/null || kill -TERM ${pid} 2>/dev/null || true`]);
-          }
-        } catch (e) {}
-        try { await IOUtils.remove(pidFile); } catch (e) {}
-      };
+      // Start background process using helper
+      self.startBackgroundProcess(ddjvuCmd, markerFile, errorFile, pidFile);
 
       const startTime = Date.now();
-      const maxWait = 300000; // 5 minutes
+      const maxWait = ZoteroDJVUConverter.TIMEOUT_CONVERSION;
 
       const checkInterval = setInterval(async () => {
         if (progress.cancelled) {
           clearInterval(checkInterval);
-          await killProcess();
+          await self.killBackgroundProcess(pidFile, "ddjvu");
           try { await IOUtils.remove(markerFile); } catch (e) {}
           try { await IOUtils.remove(errorFile); } catch (e) {}
           try { await IOUtils.remove(outputPath); } catch (e) {}
@@ -2400,8 +2483,8 @@ class ZoteroDJVUConverter {
         let done = false;
         let error = false;
 
-        try { done = Zotero.File.pathToFile(markerFile).exists(); } catch (e) {}
-        try { error = Zotero.File.pathToFile(errorFile).exists(); } catch (e) {}
+        try { done = await IOUtils.exists(markerFile); } catch (e) {}
+        try { error = await IOUtils.exists(errorFile); } catch (e) {}
 
         if (done) {
           clearInterval(checkInterval);
@@ -2418,13 +2501,13 @@ class ZoteroDJVUConverter {
           reject(new Error("DJVU conversion failed - check if file is corrupted"));
         } else if (elapsed >= maxWait) {
           clearInterval(checkInterval);
-          await killProcess();
+          await self.killBackgroundProcess(pidFile, "ddjvu");
           try { await IOUtils.remove(markerFile); } catch (e) {}
           try { await IOUtils.remove(errorFile); } catch (e) {}
           self.log("DJVU conversion timeout");
           reject(new Error("DJVU conversion timed out"));
         }
-      }, 500);
+      }, ZoteroDJVUConverter.POLL_INTERVAL_FAST);
     });
   }
 
@@ -2435,61 +2518,42 @@ class ZoteroDJVUConverter {
     this.log(`Compressing PDF: ${inputPath} -> ${compressedPath}`);
 
     return new Promise((resolve, reject) => {
-      // Ghostscript compression command
+      // Ghostscript compression command (cross-platform)
       // /ebook = 150 dpi, good balance of quality and size
       // /screen = 72 dpi, smallest but lower quality
-      const pathExport = self.getPathExport();
-
-      // Escape paths for shell
-      const escapedInput = self.escapeShellPath(inputPath);
-      const escapedCompressed = self.escapeShellPath(compressedPath);
-
-      const gsCmd = `${pathExport} "${self.gsPath}" -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/ebook -dNOPAUSE -dQUIET -dBATCH -sOutputFile="${escapedCompressed}" "${escapedInput}"`;
+      let gsCmd;
+      if (self.isWindows()) {
+        const escapedInput = self.escapeWindowsPath(inputPath);
+        const escapedCompressed = self.escapeWindowsPath(compressedPath);
+        const escapedTool = self.escapeWindowsPath(self.gsPath);
+        // On Windows, use gswin64c or gswin32c (console version)
+        gsCmd = `"${escapedTool}" -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/ebook -dNOPAUSE -dQUIET -dBATCH -sOutputFile="${escapedCompressed}" "${escapedInput}"`;
+      } else {
+        const pathExport = self.getPathExport();
+        const escapedInput = self.escapeShellPath(inputPath);
+        const escapedCompressed = self.escapeShellPath(compressedPath);
+        gsCmd = `${pathExport} "${self.gsPath}" -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/ebook -dNOPAUSE -dQUIET -dBATCH -sOutputFile="${escapedCompressed}" "${escapedInput}"`;
+      }
 
       self.log(`GS command: ${gsCmd}`);
 
       const markerFile = compressedPath + ".done";
       const errorFile = compressedPath + ".error";
       const pidFile = compressedPath + ".pid";
-      const escapedMarker = self.escapeShellPath(markerFile);
-      const escapedError = self.escapeShellPath(errorFile);
-      const escapedPidFile = self.escapeShellPath(pidFile);
 
-      // Run compression in background via shell, saving PID for cancellation
-      const fullCmd = `(${gsCmd} && touch "${escapedMarker}") || (touch "${escapedError}") & echo $! > "${escapedPidFile}"`;
-
-      // Start background process
-      Zotero.Utilities.Internal.exec("/bin/sh", ["-c", fullCmd]).catch(e => {
-        self.log(`GS background start error: ${e.message}`);
-      });
-
-      // Helper to kill process by PID
-      const killProcess = async () => {
-        try {
-          const pidContent = await Zotero.File.getContentsAsync(pidFile);
-          const pid = parseInt(pidContent.trim(), 10);
-          if (pid > 0) {
-            self.log(`Killing compression process with PID: ${pid}`);
-            await Zotero.Utilities.Internal.exec("/bin/sh", ["-c", `kill -TERM -${pid} 2>/dev/null || kill -TERM ${pid} 2>/dev/null || true`]);
-            // Also try to kill any gs processes that might be orphaned
-            await Zotero.Utilities.Internal.exec("/bin/sh", ["-c", `pkill -f "gs.*${self.escapeShellPath(compressedPath)}" 2>/dev/null || true`]);
-          }
-        } catch (e) {
-          self.log(`Could not kill process: ${e.message}`);
-        }
-        try { await IOUtils.remove(pidFile); } catch (e) {}
-      };
+      // Start background process using helper
+      self.startBackgroundProcess(gsCmd, markerFile, errorFile, pidFile);
 
       // Poll for completion
       const startTime = Date.now();
-      const maxWait = 300000; // 5 minutes max
+      const maxWait = ZoteroDJVUConverter.TIMEOUT_COMPRESSION;
 
       const checkInterval = setInterval(async () => {
         // Check if cancelled
         if (progress.cancelled) {
           clearInterval(checkInterval);
           // Kill the background process
-          await killProcess();
+          await self.killBackgroundProcess(pidFile, "gs");
           // Clean up files
           try { await IOUtils.remove(markerFile); } catch (e) {}
           try { await IOUtils.remove(errorFile); } catch (e) {}
@@ -2507,13 +2571,8 @@ class ZoteroDJVUConverter {
         let done = false;
         let error = false;
 
-        try {
-          done = Zotero.File.pathToFile(markerFile).exists();
-        } catch (e) {}
-
-        try {
-          error = Zotero.File.pathToFile(errorFile).exists();
-        } catch (e) {}
+        try { done = await IOUtils.exists(markerFile); } catch (e) {}
+        try { error = await IOUtils.exists(errorFile); } catch (e) {}
 
         if (done) {
           clearInterval(checkInterval);
@@ -2554,7 +2613,7 @@ class ZoteroDJVUConverter {
         } else if (elapsed >= maxWait) {
           clearInterval(checkInterval);
           // Kill the process on timeout
-          await killProcess();
+          await self.killBackgroundProcess(pidFile, "gs");
           // Clean up marker files on timeout
           try { await IOUtils.remove(markerFile); } catch (e) {}
           try { await IOUtils.remove(errorFile); } catch (e) {}
@@ -2562,7 +2621,7 @@ class ZoteroDJVUConverter {
           self.log("Compression timeout");
           resolve(false);
         }
-      }, 500);
+      }, ZoteroDJVUConverter.POLL_INTERVAL_FAST);
     });
   }
 
