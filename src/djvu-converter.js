@@ -1,11 +1,139 @@
 class ZoteroDJVUConverter {
   constructor() {
     this.notifierID = null;
-    this.ddjvuPath = "/opt/homebrew/bin/ddjvu";
-    this.ocrmypdfPath = "/opt/homebrew/bin/ocrmypdf";
-    this.gsPath = "/opt/homebrew/bin/gs";
+    this.ddjvuPath = null;
+    this.ocrmypdfPath = null;
+    this.gsPath = null;
     this._menuPopupHandler = null;
     this._isProcessing = false; // Prevent concurrent conversions
+    this._searchPaths = null; // Cached search paths
+  }
+
+  // Get platform-specific search paths for executables
+  getSearchPaths() {
+    if (this._searchPaths) return this._searchPaths;
+
+    const os = Services.appinfo.OS; // "Darwin", "Linux", "WINNT"
+    const paths = [];
+
+    if (os === "Darwin") {
+      // macOS: Homebrew paths (ARM first, then Intel)
+      paths.push("/opt/homebrew/bin");
+      paths.push("/usr/local/bin");
+      paths.push("/usr/bin");
+    } else if (os === "Linux") {
+      // Linux: Common paths for package managers
+      paths.push("/usr/local/bin");
+      paths.push("/usr/bin");
+      paths.push("/snap/bin"); // Snap packages (Ubuntu)
+      paths.push("/home/linuxbrew/.linuxbrew/bin"); // Linuxbrew
+      // User's local bin directories
+      try {
+        const home = Services.dirsvc.get("Home", Ci.nsIFile).path;
+        paths.push(PathUtils.join(home, ".local", "bin"));
+        paths.push(PathUtils.join(home, "bin"));
+      } catch (e) {
+        this.log(`Could not get home directory: ${e.message}`);
+      }
+    } else if (os === "WINNT") {
+      // Windows: Common paths (requires tools installed via Chocolatey, Scoop, etc.)
+      paths.push("C:\\Program Files\\DjVuLibre");
+      paths.push("C:\\Program Files\\gs\\gs10.02.1\\bin"); // Ghostscript
+      paths.push("C:\\Program Files\\Tesseract-OCR");
+      try {
+        const home = Services.dirsvc.get("Home", Ci.nsIFile).path;
+        paths.push(PathUtils.join(home, "scoop", "shims")); // Scoop
+        paths.push(PathUtils.join(home, "AppData", "Local", "Programs")); // User installs
+      } catch (e) {}
+    }
+
+    this._searchPaths = paths;
+    return paths;
+  }
+
+  // Build PATH export string for shell commands (Unix only)
+  getPathExport() {
+    const os = Services.appinfo.OS;
+    if (os === "WINNT") return ""; // Windows doesn't use this
+
+    const paths = this.getSearchPaths();
+    return `export PATH="${paths.join(":")}:$PATH";`;
+  }
+
+  // Check if running on Windows
+  isWindows() {
+    return Services.appinfo.OS === "WINNT";
+  }
+
+  // Get platform-specific install instructions for a package
+  getInstallInstructions(packages) {
+    const os = Services.appinfo.OS;
+    const pkgList = Array.isArray(packages) ? packages : [packages];
+
+    if (os === "Darwin") {
+      return pkgList.map(p => `  brew install ${p}`).join("\n");
+    } else if (os === "Linux") {
+      // Show apt commands as most common
+      const aptMap = {
+        "djvulibre": "djvulibre-bin",
+        "ocrmypdf": "ocrmypdf",
+        "tesseract": "tesseract-ocr",
+        "tesseract-lang": "tesseract-ocr-eng",
+        "ghostscript": "ghostscript"
+      };
+      return pkgList.map(p => `  sudo apt install ${aptMap[p] || p}`).join("\n");
+    } else if (os === "WINNT") {
+      const winMap = {
+        "djvulibre": "choco install djvulibre",
+        "ocrmypdf": "pip install ocrmypdf",
+        "tesseract": "choco install tesseract",
+        "tesseract-lang": "", // included with tesseract on Windows
+        "ghostscript": "choco install ghostscript"
+      };
+      return pkgList.map(p => winMap[p] ? `  ${winMap[p]}` : "").filter(s => s).join("\n");
+    }
+    return pkgList.join(", ");
+  }
+
+  // Format file size for display
+  formatSize(bytes) {
+    // Handle edge cases
+    if (bytes == null || isNaN(bytes) || bytes < 0) return "0 B";
+    if (bytes < 1024) return Math.round(bytes) + " B";
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+    return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+  }
+
+  // Get shell executable and args for cross-platform command execution
+  getShellCommand(cmd) {
+    if (this.isWindows()) {
+      return { shell: "cmd.exe", args: ["/c", cmd] };
+    }
+    return { shell: "/bin/sh", args: ["-c", cmd] };
+  }
+
+  // Execute a shell command cross-platform
+  async execShellCommand(cmd) {
+    const { shell, args } = this.getShellCommand(cmd);
+    return Zotero.Utilities.Internal.exec(shell, args);
+  }
+
+  // Supported OCR languages
+  getOcrLanguages() {
+    return [
+      { code: "eng", name: "English" },
+      { code: "rus", name: "Russian" },
+      { code: "deu", name: "German" },
+      { code: "fra", name: "French" },
+      { code: "spa", name: "Spanish" },
+      { code: "ita", name: "Italian" },
+      { code: "por", name: "Portuguese" },
+      { code: "chi_sim", name: "Chinese (S)" },
+      { code: "jpn", name: "Japanese" },
+      { code: "kor", name: "Korean" },
+      { code: "ara", name: "Arabic" },
+      { code: "ukr", name: "Ukrainian" }
+    ];
   }
 
   log(msg) {
@@ -15,13 +143,17 @@ class ZoteroDJVUConverter {
 
   // Truncate long filenames for display in dialogs
   truncateFilename(filename, maxLength = 50) {
-    if (!filename || filename.length <= maxLength) return filename;
+    // Handle edge cases
+    if (!filename) return '';
+    if (maxLength < 4) maxLength = 4; // Minimum length to show "x..."
+    if (filename.length <= maxLength) return filename;
+
     const ext = filename.lastIndexOf('.') > 0 ? filename.slice(filename.lastIndexOf('.')) : '';
     const nameWithoutExt = filename.slice(0, filename.length - ext.length);
     const available = maxLength - ext.length - 3; // 3 for "..."
     if (available <= 0) {
       // Not enough space for name + ext, just truncate the whole thing
-      return filename.slice(0, maxLength - 3) + '...';
+      return filename.slice(0, Math.max(1, maxLength - 3)) + '...';
     }
     const truncatedName = nameWithoutExt.slice(0, available) + '...';
     return truncatedName + ext;
@@ -29,11 +161,27 @@ class ZoteroDJVUConverter {
 
   // Escape path for use in shell commands (inside double quotes)
   escapeShellPath(path) {
+    // Handle null/undefined
+    if (!path) return '';
     // Escape characters that are special inside double quotes: $ ` \ " !
     // Also remove any newlines/carriage returns for safety
     return path
       .replace(/[\r\n]/g, '') // Remove newlines (shouldn't exist in filenames)
       .replace(/([\\$`"!])/g, '\\$1');
+  }
+
+  // Escape path for Windows cmd.exe (handles spaces and special chars)
+  escapeWindowsPath(path) {
+    // Handle null/undefined
+    if (!path) return '';
+    // Windows paths with spaces need to be quoted, but if we're already
+    // inside quotes, we just need to escape special characters
+    // For cmd.exe, escape: & | < > ^ % (when outside quotes)
+    // Inside quotes, most chars are safe except % and "
+    return path
+      .replace(/[\r\n]/g, '') // Remove newlines
+      .replace(/%/g, '%%')    // Escape percent signs
+      .replace(/"/g, '""');   // Escape double quotes by doubling
   }
 
   async init() {
@@ -77,9 +225,17 @@ class ZoteroDJVUConverter {
       const escapedPdf = this.escapeShellPath(pdfPath);
       const escapedTemp = this.escapeShellPath(tempFile);
 
-      await Zotero.Utilities.Internal.exec("/bin/sh", ["-c",
-        `"${this.pdfinfoPath}" "${escapedPdf}" 2>/dev/null | grep -i "^Pages:" > "${escapedTemp}"`
-      ]);
+      if (this.isWindows()) {
+        // Windows: use findstr instead of grep
+        const escapedPdfWin = this.escapeWindowsPath(pdfPath);
+        const escapedTempWin = this.escapeWindowsPath(tempFile);
+        const cmd = `"${this.pdfinfoPath}" "${escapedPdfWin}" 2>nul | findstr /i "^Pages:" > "${escapedTempWin}"`;
+        await Zotero.Utilities.Internal.exec("cmd.exe", ["/c", cmd]);
+      } else {
+        await Zotero.Utilities.Internal.exec("/bin/sh", ["-c",
+          `"${this.pdfinfoPath}" "${escapedPdf}" 2>/dev/null | grep -i "^Pages:" > "${escapedTemp}"`
+        ]);
+      }
 
       await Zotero.Promise.delay(100);
 
@@ -101,18 +257,37 @@ class ZoteroDJVUConverter {
     }
   }
 
-  // Find executable on PATH using `which`
+  // Find executable on PATH using `which` (Unix) or `where` (Windows)
   async findExecutable(name) {
     try {
-      // Write which output to a temp file since exec doesn't return stdout
+      // Write output to a temp file since exec doesn't return stdout
       const tempDir = Zotero.getTempDirectory().path;
       const tempFile = PathUtils.join(tempDir, `which_${name}_${Date.now()}.txt`);
-      const escapedTempFile = this.escapeShellPath(tempFile);
 
-      // Run which with expanded PATH and write result to temp file
-      const cmd = `export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:$PATH"; which ${name} > "${escapedTempFile}" 2>/dev/null`;
+      if (this.isWindows()) {
+        // Windows: Use 'where' command and also check common paths directly
+        const escapedTempFile = tempFile.replace(/\\/g, "\\\\");
 
-      await Zotero.Utilities.Internal.exec("/bin/sh", ["-c", cmd]);
+        // First check if executable exists in known paths
+        const searchPaths = this.getSearchPaths();
+        for (const dir of searchPaths) {
+          const exePath = PathUtils.join(dir, name + ".exe");
+          try {
+            if (await IOUtils.exists(exePath)) {
+              return exePath;
+            }
+          } catch (e) {}
+        }
+
+        // Fall back to 'where' command
+        const cmd = `where ${name} > "${escapedTempFile}" 2>nul`;
+        await Zotero.Utilities.Internal.exec("cmd.exe", ["/c", cmd]);
+      } else {
+        // Unix: Use 'which' with expanded PATH
+        const escapedTempFile = this.escapeShellPath(tempFile);
+        const cmd = `${this.getPathExport()} which ${name} > "${escapedTempFile}" 2>/dev/null`;
+        await Zotero.Utilities.Internal.exec("/bin/sh", ["-c", cmd]);
+      }
 
       // Small delay to ensure file is written
       await Zotero.Promise.delay(100);
@@ -122,11 +297,16 @@ class ZoteroDJVUConverter {
       try {
         const content = await Zotero.File.getContentsAsync(tempFile);
         const trimmed = content?.trim();
-        if (trimmed && trimmed.length > 0 && trimmed.startsWith("/")) {
-          foundPath = trimmed;
+        if (trimmed && trimmed.length > 0) {
+          // Unix paths start with /, Windows paths start with drive letter (e.g., C:\)
+          const isValidPath = trimmed.startsWith("/") || /^[A-Za-z]:[\\\/]/.test(trimmed);
+          if (isValidPath) {
+            // On Windows, 'where' may return multiple lines; take the first one
+            foundPath = trimmed.split(/[\r\n]/)[0].trim();
+          }
         }
       } catch (e) {
-        // File might not exist if which failed
+        // File might not exist if which/where failed
       }
 
       // Clean up temp file
@@ -167,17 +347,66 @@ class ZoteroDJVUConverter {
 
     message += "\n--- Install missing dependencies ---\n\n";
 
-    if (!this.ddjvuFound) {
-      message += "  brew install djvulibre\n";
-    }
-    if (!this.ocrmypdfFound) {
-      message += "  brew install ocrmypdf\n";
-    }
-    if (!this.tesseractFound) {
-      message += "  brew install tesseract tesseract-lang\n";
-    }
-    if (!this.gsFound) {
-      message += "  brew install ghostscript\n";
+    const os = Services.appinfo.OS;
+
+    if (os === "Darwin") {
+      // macOS instructions
+      if (!this.ddjvuFound) {
+        message += "  brew install djvulibre\n";
+      }
+      if (!this.ocrmypdfFound) {
+        message += "  brew install ocrmypdf\n";
+      }
+      if (!this.tesseractFound) {
+        message += "  brew install tesseract tesseract-lang\n";
+      }
+      if (!this.gsFound) {
+        message += "  brew install ghostscript\n";
+      }
+    } else if (os === "Linux") {
+      // Linux instructions (Debian/Ubuntu)
+      message += "Debian/Ubuntu:\n";
+      if (!this.ddjvuFound) {
+        message += "  sudo apt install djvulibre-bin\n";
+      }
+      if (!this.ocrmypdfFound) {
+        message += "  sudo apt install ocrmypdf\n";
+      }
+      if (!this.tesseractFound) {
+        message += "  sudo apt install tesseract-ocr tesseract-ocr-eng\n";
+      }
+      if (!this.gsFound) {
+        message += "  sudo apt install ghostscript\n";
+      }
+      message += "\nFedora/RHEL:\n";
+      if (!this.ddjvuFound) {
+        message += "  sudo dnf install djvulibre\n";
+      }
+      if (!this.ocrmypdfFound) {
+        message += "  sudo dnf install ocrmypdf\n";
+      }
+      if (!this.tesseractFound) {
+        message += "  sudo dnf install tesseract tesseract-langpack-eng\n";
+      }
+      if (!this.gsFound) {
+        message += "  sudo dnf install ghostscript\n";
+      }
+    } else if (os === "WINNT") {
+      // Windows instructions
+      message += "Using Chocolatey:\n";
+      if (!this.ddjvuFound) {
+        message += "  choco install djvulibre\n";
+      }
+      if (!this.ocrmypdfFound) {
+        message += "  pip install ocrmypdf\n";
+      }
+      if (!this.tesseractFound) {
+        message += "  choco install tesseract\n";
+      }
+      if (!this.gsFound) {
+        message += "  choco install ghostscript\n";
+      }
+      message += "\nOr download installers from project websites.";
     }
 
     message += "\nRestart Zotero after installing.";
@@ -373,7 +602,7 @@ class ZoteroDJVUConverter {
         "DJVU to PDF Converter - Error",
         "Cannot convert: ddjvu (djvulibre) is not installed.\n\n" +
         "Please install it with:\n" +
-        "  brew install djvulibre\n\n" +
+        this.getInstallInstructions("djvulibre") + "\n\n" +
         "Then restart Zotero."
       );
       return;
@@ -443,7 +672,7 @@ class ZoteroDJVUConverter {
         "DJVU to PDF Converter - Error",
         `Cannot add OCR: ${missingDeps.join(" and ")} not installed.\n\n` +
         "Please install with:\n" +
-        "  brew install ocrmypdf tesseract tesseract-lang\n\n" +
+        this.getInstallInstructions(["ocrmypdf", "tesseract", "tesseract-lang"]) + "\n\n" +
         "Then restart Zotero."
       );
       return;
@@ -506,7 +735,7 @@ class ZoteroDJVUConverter {
         "DJVU to PDF Converter - Error",
         "Cannot compress: ghostscript is not installed.\n\n" +
         "Please install it with:\n" +
-        "  brew install ghostscript\n\n" +
+        this.getInstallInstructions("ghostscript") + "\n\n" +
         "Then restart Zotero."
       );
       return;
@@ -570,9 +799,15 @@ class ZoteroDJVUConverter {
       const escapedPdf = this.escapeShellPath(filePath);
       const escapedTxt = this.escapeShellPath(tempTextFile);
 
-      const cmd = `"${this.pdftotextPath}" -f 1 -l 3 "${escapedPdf}" "${escapedTxt}" 2>/dev/null`;
-
-      await Zotero.Utilities.Internal.exec("/bin/sh", ["-c", cmd]);
+      if (this.isWindows()) {
+        const escapedPdfWin = this.escapeWindowsPath(filePath);
+        const escapedTxtWin = this.escapeWindowsPath(tempTextFile);
+        const cmd = `"${this.pdftotextPath}" -f 1 -l 3 "${escapedPdfWin}" "${escapedTxtWin}" 2>nul`;
+        await Zotero.Utilities.Internal.exec("cmd.exe", ["/c", cmd]);
+      } else {
+        const cmd = `"${this.pdftotextPath}" -f 1 -l 3 "${escapedPdf}" "${escapedTxt}" 2>/dev/null`;
+        await Zotero.Utilities.Internal.exec("/bin/sh", ["-c", cmd]);
+      }
 
       // Wait a bit for file to be written
       await Zotero.Promise.delay(200);
@@ -670,21 +905,7 @@ class ZoteroDJVUConverter {
       const langGrid = doc.createElement("div");
       langGrid.style.cssText = "display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px 12px; margin-bottom: 16px;";
 
-      const languages = [
-        { code: "eng", name: "English" },
-        { code: "rus", name: "Russian" },
-        { code: "deu", name: "German" },
-        { code: "fra", name: "French" },
-        { code: "spa", name: "Spanish" },
-        { code: "ita", name: "Italian" },
-        { code: "por", name: "Portuguese" },
-        { code: "chi_sim", name: "Chinese (S)" },
-        { code: "jpn", name: "Japanese" },
-        { code: "kor", name: "Korean" },
-        { code: "ara", name: "Arabic" },
-        { code: "ukr", name: "Ukrainian" }
-      ];
-
+      const languages = this.getOcrLanguages();
       const langChecks = [];
 
       for (const lang of languages) {
@@ -926,15 +1147,9 @@ class ZoteroDJVUConverter {
           } catch (e) {}
         }
 
-        const formatSize = (bytes) => {
-          if (bytes < 1024) return bytes + " B";
-          if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
-          return (bytes / (1024 * 1024)).toFixed(1) + " MB";
-        };
-
-        let sizeInfo = `${formatSize(inputSize)} → OCR: ${formatSize(afterOcrSize)}`;
+        let sizeInfo = `${this.formatSize(inputSize)} → OCR: ${this.formatSize(afterOcrSize)}`;
         if (shouldCompress && wasCompressed) {
-          sizeInfo += ` → Compressed: ${formatSize(finalSize)}`;
+          sizeInfo += ` → Compressed: ${this.formatSize(finalSize)}`;
         }
 
         progress.finish(true, "Done! " + sizeInfo);
@@ -1001,17 +1216,11 @@ class ZoteroDJVUConverter {
       inputSize = Zotero.File.pathToFile(filePath).fileSize;
     } catch (e) {}
 
-    const formatSize = (bytes) => {
-      if (bytes < 1024) return bytes + " B";
-      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
-      return (bytes / (1024 * 1024)).toFixed(1) + " MB";
-    };
-
     // Confirm with user
     const confirm = Services.prompt.confirm(
       null,
       "Compress PDF",
-      `Compress "${filename}" (${formatSize(inputSize)})?\n\nThis will reduce file size but may slightly reduce quality.`
+      `Compress "${filename}" (${this.formatSize(inputSize)})?\n\nThis will reduce file size but may slightly reduce quality.`
     );
 
     if (!confirm) return;
@@ -1039,8 +1248,8 @@ class ZoteroDJVUConverter {
       } catch (e) {}
 
       if (compressed) {
-        const savings = Math.round((1 - outputSize / inputSize) * 100);
-        const sizeInfo = `${formatSize(inputSize)} → ${formatSize(outputSize)} (${savings}% smaller)`;
+        const savings = inputSize > 0 ? Math.round((1 - outputSize / inputSize) * 100) : 0;
+        const sizeInfo = `${this.formatSize(inputSize)} → ${this.formatSize(outputSize)} (${savings}% smaller)`;
         progress.finish(true, "Compressed! " + sizeInfo);
         this.log("PDF compressed successfully");
       } else {
@@ -1208,22 +1417,7 @@ class ZoteroDJVUConverter {
       const langGrid = doc.createElement("div");
       langGrid.style.cssText = "display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px 12px;";
 
-      const languages = [
-        { code: "eng", name: "English" },
-        { code: "rus", name: "Russian" },
-        { code: "deu", name: "German" },
-        { code: "fra", name: "French" },
-        { code: "spa", name: "Spanish" },
-        { code: "ita", name: "Italian" },
-        { code: "por", name: "Portuguese" },
-        { code: "chi_sim", name: "Chinese (S)" },
-        { code: "jpn", name: "Japanese" },
-        { code: "kor", name: "Korean" },
-        { code: "ara", name: "Arabic" },
-        { code: "ukr", name: "Ukrainian" }
-      ];
-
-      // Store language checkboxes
+      const languages = self.getOcrLanguages();
       const langChecks = [];
 
       for (const lang of languages) {
@@ -1437,6 +1631,9 @@ class ZoteroDJVUConverter {
             progress.setText(msg || "Failed");
           }
           progressWin.startCloseTimer(4000);
+        },
+        close: () => {
+          progressWin.close();
         }
       };
     }
@@ -1621,7 +1818,7 @@ class ZoteroDJVUConverter {
         "DJVU to PDF Converter - Error",
         "Cannot convert: ddjvu (djvulibre) is not installed.\n\n" +
         "Please install it with:\n" +
-        "  brew install djvulibre\n\n" +
+        this.getInstallInstructions("djvulibre") + "\n\n" +
         "Then restart Zotero."
       );
       return;
@@ -1646,7 +1843,7 @@ class ZoteroDJVUConverter {
         "DJVU to PDF Converter - Warning",
         `OCR dependencies missing: ${missingDeps.join(", ")}\n\n` +
         "To enable OCR, install with:\n" +
-        "  brew install ocrmypdf tesseract tesseract-lang\n\n" +
+        this.getInstallInstructions(["ocrmypdf", "tesseract", "tesseract-lang"]) + "\n\n" +
         "Continue conversion without OCR?"
       );
       if (!continueWithoutOcr) {
@@ -1668,13 +1865,6 @@ class ZoteroDJVUConverter {
       } catch (e) {
         return 0;
       }
-    };
-
-    // Helper to format size
-    const formatSize = (bytes) => {
-      if (bytes < 1024) return bytes + " B";
-      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
-      return (bytes / (1024 * 1024)).toFixed(1) + " MB";
     };
 
     // Track sizes at each stage
@@ -1717,7 +1907,7 @@ class ZoteroDJVUConverter {
       }
 
       sizes.afterConversion = getSize(tempPdfPath);
-      this.log(`Size after conversion: ${formatSize(sizes.afterConversion)}`);
+      this.log(`Size after conversion: ${this.formatSize(sizes.afterConversion)}`);
 
       // Check if cancelled after conversion
       if (progress.cancelled) {
@@ -1750,7 +1940,7 @@ class ZoteroDJVUConverter {
             await IOUtils.remove(tempPdfPath);
             await IOUtils.move(ocrPdfPath, tempPdfPath);
             sizes.afterOcr = getSize(tempPdfPath);
-            this.log(`OCR completed successfully. Size after OCR: ${formatSize(sizes.afterOcr)}`);
+            this.log(`OCR completed successfully. Size after OCR: ${this.formatSize(sizes.afterOcr)}`);
           } else {
             sizes.afterOcr = sizes.afterConversion;
             this.log("OCR output not found, using non-OCR version");
@@ -1816,7 +2006,7 @@ class ZoteroDJVUConverter {
 
         sizes.afterCompression = getSize(finalPdfPath);
         if (compressed) {
-          this.log(`PDF compression completed. Size after compression: ${formatSize(sizes.afterCompression)}`);
+          this.log(`PDF compression completed. Size after compression: ${this.formatSize(sizes.afterCompression)}`);
         } else {
           this.log("PDF compression skipped (no size reduction)");
         }
@@ -1869,15 +2059,15 @@ class ZoteroDJVUConverter {
       }
 
       // Build size info string
-      let sizeInfo = `DJVU: ${formatSize(sizes.original)}`;
-      sizeInfo += ` → PDF: ${formatSize(sizes.afterConversion)}`;
+      let sizeInfo = `DJVU: ${this.formatSize(sizes.original)}`;
+      sizeInfo += ` → PDF: ${this.formatSize(sizes.afterConversion)}`;
 
       if (options.addOcr) {
-        sizeInfo += ` → OCR: ${formatSize(sizes.afterOcr)}`;
+        sizeInfo += ` → OCR: ${this.formatSize(sizes.afterOcr)}`;
       }
 
       if (options.compress && this.gsFound) {
-        sizeInfo += ` → Compressed: ${formatSize(sizes.final)}`;
+        sizeInfo += ` → Compressed: ${this.formatSize(sizes.final)}`;
       }
 
       progress.finish(true, "Done! " + sizeInfo);
@@ -1992,10 +2182,9 @@ class ZoteroDJVUConverter {
       // --skip-text = skip pages with text (normal mode)
       // --force-ocr = redo OCR even if text exists (force mode)
       // --verbose = output progress info for page tracking
-      // Set PATH to include Homebrew so tesseract can be found
       const errorLogFile = outputPath + ".log";
       const pidFile = outputPath + ".pid";
-      const pathExport = 'export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH";';
+      const pathExport = self.getPathExport();
 
       // Escape paths for shell
       const escapedInput = self.escapeShellPath(inputPath);
@@ -2004,7 +2193,7 @@ class ZoteroDJVUConverter {
       const escapedPidFile = self.escapeShellPath(pidFile);
 
       // Validate language string (only allow alphanumeric, underscore, plus)
-      let safeLangs = languages.replace(/[^a-zA-Z0-9_+]/g, '');
+      let safeLangs = (languages || 'eng').replace(/[^a-zA-Z0-9_+]/g, '');
       // Fallback to English if empty after sanitization
       if (!safeLangs || safeLangs === '+') {
         safeLangs = 'eng';
@@ -2249,7 +2438,7 @@ class ZoteroDJVUConverter {
       // Ghostscript compression command
       // /ebook = 150 dpi, good balance of quality and size
       // /screen = 72 dpi, smallest but lower quality
-      const pathExport = 'export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH";';
+      const pathExport = self.getPathExport();
 
       // Escape paths for shell
       const escapedInput = self.escapeShellPath(inputPath);
@@ -2341,7 +2530,8 @@ class ZoteroDJVUConverter {
               // Replace original with compressed
               await IOUtils.remove(inputPath);
               await IOUtils.move(compressedPath, inputPath);
-              self.log(`Compression saved ${Math.round((1 - compressedSize / originalSize) * 100)}%`);
+              const savings = originalSize > 0 ? Math.round((1 - compressedSize / originalSize) * 100) : 0;
+              self.log(`Compression saved ${savings}%`);
               resolve(true);
             } else {
               // Keep original, delete compressed
