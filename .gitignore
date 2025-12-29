@@ -1,0 +1,17 @@
+# Build output
+build/
+*.xpi
+
+# macOS
+.DS_Store
+__MACOSX/
+
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Notes and screenshots
+notes/
