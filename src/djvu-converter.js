@@ -2022,13 +2022,6 @@ class ZoteroDJVUConverter {
         }
       };
       doc.addEventListener("keydown", handleKeydown);
-
-      overlay.onclick = (e) => {
-        if (e.target === overlay) {
-          cleanup();
-          resolve(null);
-        }
-      };
     });
   }
 
@@ -2098,13 +2091,6 @@ class ZoteroDJVUConverter {
         }
       };
       doc.addEventListener("keydown", handleKeydown);
-
-      overlay.onclick = (e) => {
-        if (e.target === overlay) {
-          cleanup();
-          resolve(null);
-        }
-      };
     });
   }
 
@@ -2597,13 +2583,6 @@ class ZoteroDJVUConverter {
         }
       };
       doc.addEventListener("keydown", handleKeydown);
-
-      overlay.onclick = (e) => {
-        if (e.target === overlay) {
-          cleanup();
-          resolve(null);
-        }
-      };
     });
   }
 
@@ -2640,58 +2619,78 @@ class ZoteroDJVUConverter {
     const existing = doc.getElementById("djvu-progress-dialog");
     if (existing) existing.remove();
 
-    const overlay = this.createOverlay(doc, "djvu-progress-dialog");
-    const dialog = this.createDialog(doc);
-    dialog.style.minWidth = "320px";
+    // Create non-blocking floating dialog (no overlay)
+    const dialog = doc.createElement("div");
+    dialog.id = "djvu-progress-dialog";
+    dialog.style.cssText = `
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      background: white;
+      border-radius: 8px;
+      padding: 16px 20px;
+      min-width: 280px;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      color: #333;
+      z-index: 10000;
+      border: 1px solid #ccc;
+    `;
 
-    dialog.appendChild(this.createTitle(doc, "DJVU to PDF Converter"));
+    // Title
+    const title = doc.createElement("div");
+    title.textContent = "DJVU to PDF Converter";
+    title.style.cssText = "font-size: 14px; font-weight: bold; margin-bottom: 10px;";
+    dialog.appendChild(title);
 
     // Status text
     const statusText = doc.createElement("div");
     statusText.textContent = message;
-    statusText.style.cssText = "margin-bottom: 16px; color: #666; min-height: 20px;";
+    statusText.style.cssText = "margin-bottom: 12px; color: #666; min-height: 18px; font-size: 13px;";
     dialog.appendChild(statusText);
 
     // Cancel button (danger style, full width)
     const cancelBtn = doc.createElement("button");
     cancelBtn.textContent = "Cancel";
     const S = ZoteroDJVUConverter.STYLES;
-    cancelBtn.style.cssText = S.BUTTON_BASE + S.BUTTON_DANGER + " width: 100%; padding: 10px 16px;";
+    cancelBtn.style.cssText = S.BUTTON_BASE + S.BUTTON_DANGER + " width: 100%; padding: 8px 16px;";
     cancelBtn.onmouseenter = () => { cancelBtn.style.background = "linear-gradient(to bottom, #ee3333, #aa0000)"; };
     cancelBtn.onmouseleave = () => { cancelBtn.style.background = "linear-gradient(to bottom, #ff4444, #cc0000)"; };
     dialog.appendChild(cancelBtn);
 
-    overlay.appendChild(dialog);
-    doc.documentElement.appendChild(overlay);
+    doc.documentElement.appendChild(dialog);
 
     // Progress controller object
     const controller = {
       cancelled: false,
       finished: false,
-      overlay: overlay,
+      dialog: dialog,
       updateText: (text) => {
-        if (!controller.cancelled && !controller.finished) statusText.textContent = text;
+        if (!controller.cancelled && !controller.finished && dialog.parentNode) {
+          statusText.textContent = text;
+        }
       },
       setProgress: (percent) => {}, // No-op for backward compatibility
       finish: (success, msg) => {
-        if (controller.cancelled) return;
+        if (controller.cancelled || !dialog.parentNode) return;
         controller.finished = true;
         statusText.textContent = msg || (success ? "Done!" : "Failed");
         statusText.style.color = success ? "#00aa00" : "#cc0000";
 
         // Switch to secondary style
         cancelBtn.textContent = "Close";
-        cancelBtn.style.cssText = S.BUTTON_BASE + S.BUTTON_SECONDARY + " width: 100%; padding: 10px 16px;";
+        cancelBtn.style.cssText = S.BUTTON_BASE + S.BUTTON_SECONDARY + " width: 100%; padding: 8px 16px;";
         cancelBtn.onmouseenter = () => { cancelBtn.style.background = "linear-gradient(to bottom, #e8e8e8, #d8d8d8)"; };
         cancelBtn.onmouseleave = () => { cancelBtn.style.background = "linear-gradient(to bottom, #f8f8f8, #e8e8e8)"; };
       },
-      close: () => { if (overlay.parentNode) overlay.remove(); }
+      close: () => { if (dialog.parentNode) dialog.remove(); }
     };
 
     // Cancel button handler
     cancelBtn.onclick = () => {
+      if (!dialog.parentNode) return;
       if (controller.cancelled || controller.finished) {
-        overlay.remove();
+        dialog.remove();
         return;
       }
       controller.cancelled = true;
@@ -3416,52 +3415,65 @@ class ZoteroDJVUConverter {
   }
 
   async getDjvuPageCount(inputPath) {
-    const self = this;
-    return new Promise((resolve) => {
+    try {
+      // Find djvused - try same directory as ddjvu first, then search PATH
+      let djvusedPath = this.ddjvuPath.replace(/ddjvu([^\/\\]*)$/, "djvused$1");
+
+      // Check if djvused exists at the guessed path
+      let djvusedExists = false;
       try {
-        // Find djvused (part of djvulibre, same as ddjvu)
-        const djvusedPath = self.ddjvuPath.replace(/ddjvu([^\/\\]*)$/, "djvused$1");
-        const tempFile = PathUtils.join(Zotero.getTempDirectory().path, `djvu_pagecount_${Date.now()}.txt`);
+        djvusedExists = Zotero.File.pathToFile(djvusedPath).exists();
+      } catch (e) {}
 
-        let cmd;
-        if (self.isWindows()) {
-          const escapedInput = self.escapeWindowsPath(inputPath);
-          const escapedTool = self.escapeWindowsPath(djvusedPath);
-          const escapedTemp = self.escapeWindowsPath(tempFile);
-          cmd = `"${escapedTool}" "${escapedInput}" -e "n" > "${escapedTemp}" 2>&1`;
-        } else {
-          const escapedInput = self.escapeShellPath(inputPath);
-          const escapedTemp = self.escapeShellPath(tempFile);
-          // Set LANG for UTF-8 support (needed for non-ASCII filenames like Cyrillic)
-          cmd = `export LANG=en_US.UTF-8; "${djvusedPath}" "${escapedInput}" -e 'n' > "${escapedTemp}" 2>&1`;
+      if (!djvusedExists) {
+        // Try to find djvused on PATH
+        djvusedPath = await this.findExecutable("djvused");
+        if (!djvusedPath) {
+          this.log("djvused not found, cannot get DJVU page count");
+          return null;
         }
-
-        const process = Components.classes["@mozilla.org/process/util;1"]
-          .createInstance(Components.interfaces.nsIProcess);
-        const shell = self.isWindows() ? "cmd.exe" : "/bin/sh";
-        const shellArgs = self.isWindows() ? ["/c", cmd] : ["-c", cmd];
-        const shellFile = Components.classes["@mozilla.org/file/local;1"]
-          .createInstance(Components.interfaces.nsIFile);
-        shellFile.initWithPath(shell);
-        process.init(shellFile);
-        process.run(true, shellArgs, shellArgs.length);
-
-        // Read result
-        setTimeout(async () => {
-          try {
-            const content = await Zotero.File.getContentsAsync(tempFile);
-            const pageCount = parseInt(content.trim(), 10);
-            try { await IOUtils.remove(tempFile); } catch (e) {}
-            resolve(isNaN(pageCount) ? null : pageCount);
-          } catch (e) {
-            resolve(null);
-          }
-        }, 100);
-      } catch (e) {
-        self.log(`Failed to get DJVU page count: ${e.message}`);
-        resolve(null);
       }
-    });
+
+      this.log(`Using djvused at: ${djvusedPath}`);
+
+      const tempFile = PathUtils.join(Zotero.getTempDirectory().path, `djvu_pagecount_${Date.now()}.txt`);
+
+      let cmd;
+      if (this.isWindows()) {
+        const escapedInput = this.escapeWindowsPath(inputPath);
+        const escapedTool = this.escapeWindowsPath(djvusedPath);
+        const escapedTemp = this.escapeWindowsPath(tempFile);
+        cmd = `"${escapedTool}" "${escapedInput}" -e "n" > "${escapedTemp}" 2>&1`;
+        await Zotero.Utilities.Internal.exec("cmd.exe", ["/c", cmd]);
+      } else {
+        const escapedInput = this.escapeShellPath(inputPath);
+        const escapedTemp = this.escapeShellPath(tempFile);
+        // Set LANG for UTF-8 support (needed for non-ASCII filenames like Cyrillic)
+        cmd = `export LANG=en_US.UTF-8; "${djvusedPath}" "${escapedInput}" -e 'n' > "${escapedTemp}" 2>&1`;
+        await Zotero.Utilities.Internal.exec("/bin/sh", ["-c", cmd]);
+      }
+
+      // Small delay to ensure file is written
+      await Zotero.Promise.delay(50);
+
+      let pageCount = null;
+      try {
+        const content = await Zotero.File.getContentsAsync(tempFile);
+        this.log(`djvused output: "${content.trim()}"`);
+        pageCount = parseInt(content.trim(), 10);
+        if (isNaN(pageCount)) pageCount = null;
+      } catch (e) {
+        this.log(`Failed to read djvused output: ${e.message}`);
+      }
+
+      try { await IOUtils.remove(tempFile); } catch (e) {}
+
+      this.log(`DJVU page count: ${pageCount}`);
+      return pageCount;
+    } catch (e) {
+      this.log(`Failed to get DJVU page count: ${e.message}`);
+      return null;
+    }
   }
 
   async runDdjvuWithProgress(inputPath, outputPath, progress, batchPrefix = "") {
