@@ -16,6 +16,8 @@ A Zotero 7/8 plugin that converts DJVU files to PDF with optional OCR and compre
 - **Flexible Options**: Choose to replace original or keep both files
 - **Progress Tracking**: Visual progress with cancel button
 - **Size Reporting**: Shows file size at each conversion stage
+- **Batch Processing**: Queue system for processing multiple files sequentially
+- **Smart Auto-detect**: Debounced detection batches multiple files added together
 
 ## Requirements
 
@@ -119,7 +121,7 @@ cd zotero-djvu-converter
 # Build the plugin
 bash build.sh
 
-# Output: build/djvu-converter-1.4.0.xpi
+# Output: build/djvu-converter-1.6.0.xpi
 ```
 
 ## Project Structure
@@ -159,6 +161,41 @@ Make sure the required language pack is installed:
 - **macOS**: `brew install tesseract-lang`
 - **Linux**: `sudo apt install tesseract-ocr-<lang>` (e.g., `tesseract-ocr-deu` for German)
 - **Windows**: Download language packs from [Tesseract GitHub](https://github.com/tesseract-ocr/tessdata)
+
+## Changelog
+
+### v1.6.0
+- **Queue System**: Operations now queue sequentially with "Cancel All" support
+- **Batch Auto-convert**: Multiple DJVU files added together are batched (200ms debounce)
+- **Progress Fixes**: No more [1/1] for single files, immediate close on cancel
+- **Stability**: Orphaned temp file cleanup, better error handling in notifier
+- **Edge Cases**: Prevent duplicate operations on same file
+
+### v1.5.x
+- Non-blocking progress dialog
+- Batch processing for manual operations
+- Process cleanup on cancel
+- Compression safeguards
+
+### v1.4.x
+- Code refactoring
+- Ghostscript removal (using ocrmypdf for compression)
+
+### v1.3.0
+- Page-by-page progress display
+- Bug fixes for cancellation
+
+### v1.2.0
+- PDF compression feature
+- Multiple language OCR support
+
+### v1.1.0
+- OCR support with tesseract
+- Context menu integration
+
+### v1.0.0
+- Initial release
+- DJVU to PDF conversion
 
 ## License
 
