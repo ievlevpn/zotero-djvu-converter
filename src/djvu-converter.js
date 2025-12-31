@@ -1,6 +1,6 @@
 class ZoteroDJVUConverter {
   // Timeouts (in milliseconds)
-  static TIMEOUT_OCR = 600000;           // 10 minutes for OCR
+  static TIMEOUT_OCR = 1800000;          // 30 minutes for OCR
   static TIMEOUT_CONVERSION = 300000;    // 5 minutes for DJVU conversion
 
   // Polling intervals (in milliseconds)

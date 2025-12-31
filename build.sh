@@ -5,7 +5,7 @@
 set -e
 
 PLUGIN_NAME="djvu-converter"
-VERSION="1.4.1"
+VERSION="1.4.2"
 OUTPUT_DIR="build"
 XPI_NAME="${PLUGIN_NAME}-${VERSION}.xpi"
 
