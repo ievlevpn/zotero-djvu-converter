@@ -54,8 +54,28 @@ class ZoteroDJVUConverter {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       color: #333;
     `,
+    PROGRESS_DIALOG: `
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      background: white;
+      border-radius: 8px;
+      padding: 16px 20px;
+      min-width: 280px;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      color: #333;
+      z-index: 10000;
+      border: 1px solid #ccc;
+    `,
     TITLE: "font-size: 16px; font-weight: bold; margin-bottom: 15px;",
+    TITLE_SMALL: "font-size: 14px; font-weight: bold; margin-bottom: 10px;",
     LABEL: "font-weight: 500; margin-bottom: 10px;",
+    LABEL_SMALL: "font-size: 12px; color: #666; margin-bottom: 6px;",
+    MESSAGE: "margin-bottom: 20px; color: #666;",
+    STATUS_TEXT: "margin-bottom: 8px; color: #666; min-height: 18px; font-size: 13px;",
+    QUEUE_INFO: "margin-bottom: 12px; color: #888; font-size: 12px; display: none;",
+    NOTE_DISABLED: "font-size: 11px; color: #999; margin-top: 4px;",
     BUTTON_BASE: `
       padding: 8px 16px;
       border-radius: 6px;
@@ -87,7 +107,13 @@ class ZoteroDJVUConverter {
     `,
     SELECT: "width: 100%; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px;",
     CHECKBOX: "margin-right: 8px; width: 16px; height: 16px;",
-    BUTTONS_CONTAINER: "display: flex; justify-content: flex-end; gap: 10px; margin-top: 10px;"
+    CHECKBOX_SMALL: "margin-right: 4px; width: 14px; height: 14px;",
+    BUTTONS_CONTAINER: "display: flex; justify-content: flex-end; gap: 10px; margin-top: 10px;",
+    SECTION: "margin-bottom: 16px;",
+    INDENT: "margin-left: 24px; margin-bottom: 12px;",
+    LANG_GRID: "display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px 12px;",
+    LANG_OPTION: "display: flex; align-items: center; cursor: pointer; font-size: 12px;",
+    RADIO_LABEL: "display: flex; align-items: center; margin-bottom: 8px; cursor: pointer;"
   };
 
   // Create modal overlay element
@@ -162,8 +188,9 @@ class ZoteroDJVUConverter {
 
   // Create checkbox with label
   createCheckbox(doc, id, labelText, checked = false, disabled = false) {
+    const S = ZoteroDJVUConverter.STYLES;
     const label = doc.createElement("label");
-    label.style.cssText = `display: flex; align-items: center; margin-bottom: 8px; cursor: ${disabled ? "default" : "pointer"};`;
+    label.style.cssText = S.RADIO_LABEL + (disabled ? " cursor: default;" : "");
     if (disabled) label.style.color = "#999";
 
     const checkbox = doc.createElement("input");
@@ -171,12 +198,114 @@ class ZoteroDJVUConverter {
     checkbox.id = id;
     checkbox.checked = checked;
     checkbox.disabled = disabled;
-    checkbox.style.cssText = ZoteroDJVUConverter.STYLES.CHECKBOX;
+    checkbox.style.cssText = S.CHECKBOX;
 
     label.appendChild(checkbox);
     label.appendChild(doc.createTextNode(labelText));
 
     return { label, checkbox };
+  }
+
+  // Create message/description text
+  createMessage(doc, text) {
+    const div = doc.createElement("div");
+    div.textContent = text;
+    div.style.cssText = ZoteroDJVUConverter.STYLES.MESSAGE;
+    return div;
+  }
+
+  // Create section container
+  createSection(doc) {
+    const div = doc.createElement("div");
+    div.style.cssText = ZoteroDJVUConverter.STYLES.SECTION;
+    return div;
+  }
+
+  // Create language selection grid
+  // Returns { container, getSelectedLanguages }
+  createLanguageGrid(doc, defaultLanguages = ["eng"]) {
+    const S = ZoteroDJVUConverter.STYLES;
+    const languages = [
+      { code: "eng", label: "English" },
+      { code: "rus", label: "Russian" },
+      { code: "deu", label: "German" },
+      { code: "fra", label: "French" },
+      { code: "spa", label: "Spanish" },
+      { code: "ita", label: "Italian" },
+      { code: "por", label: "Portuguese" },
+      { code: "chi_sim", label: "Chinese" },
+      { code: "jpn", label: "Japanese" },
+      { code: "kor", label: "Korean" },
+      { code: "ara", label: "Arabic" },
+      { code: "ukr", label: "Ukrainian" }
+    ];
+
+    const container = doc.createElement("div");
+    const grid = doc.createElement("div");
+    grid.style.cssText = S.LANG_GRID;
+
+    const checkboxes = [];
+    for (const lang of languages) {
+      const langOption = doc.createElement("label");
+      langOption.style.cssText = S.LANG_OPTION;
+
+      const check = doc.createElement("input");
+      check.type = "checkbox";
+      check.value = lang.code;
+      check.checked = defaultLanguages.includes(lang.code);
+      check.style.cssText = S.CHECKBOX_SMALL;
+      checkboxes.push(check);
+
+      langOption.appendChild(check);
+      langOption.appendChild(doc.createTextNode(lang.label));
+      grid.appendChild(langOption);
+    }
+
+    container.appendChild(grid);
+
+    return {
+      container,
+      getSelectedLanguages: () => {
+        const selected = checkboxes.filter(cb => cb.checked).map(cb => cb.value);
+        return selected.length > 0 ? selected : ["eng"];
+      }
+    };
+  }
+
+  // Create radio button group
+  // options: [{ id, label, checked }]
+  // Returns { container, radios }
+  createRadioGroup(doc, name, options) {
+    const S = ZoteroDJVUConverter.STYLES;
+    const container = doc.createElement("div");
+    const radios = {};
+
+    for (const opt of options) {
+      const label = doc.createElement("label");
+      label.style.cssText = S.RADIO_LABEL + (opt.last ? "" : " margin-bottom: 8px;");
+
+      const radio = doc.createElement("input");
+      radio.type = "radio";
+      radio.name = name;
+      radio.id = opt.id;
+      radio.checked = opt.checked || false;
+      radio.style.cssText = S.CHECKBOX;
+
+      label.appendChild(radio);
+      label.appendChild(doc.createTextNode(opt.label));
+      container.appendChild(label);
+      radios[opt.id] = radio;
+    }
+
+    return { container, radios };
+  }
+
+  // Create disabled feature note
+  createDisabledNote(doc, text) {
+    const note = doc.createElement("div");
+    note.textContent = text;
+    note.style.cssText = ZoteroDJVUConverter.STYLES.NOTE_DISABLED;
+    return note;
   }
 
   constructor() {
@@ -1477,18 +1606,16 @@ class ZoteroDJVUConverter {
       const overlay = this.createOverlay(doc, "djvu-options-dialog");
       const dialog = this.createDialog(doc);
 
+      const S = ZoteroDJVUConverter.STYLES;
       dialog.appendChild(this.createTitle(doc, "DJVU to PDF Converter"));
 
       // File count message
-      const countDiv = doc.createElement("div");
-      countDiv.textContent = `Convert ${fileCount} DJVU files to PDF?`;
-      countDiv.style.cssText = "margin-bottom: 20px; color: #666;";
-      dialog.appendChild(countDiv);
+      dialog.appendChild(this.createMessage(doc, `Convert ${fileCount} DJVU files to PDF?`));
 
       // Options label
       const optionsLabel = doc.createElement("div");
       optionsLabel.textContent = "Options (apply to all files):";
-      optionsLabel.style.cssText = ZoteroDJVUConverter.STYLES.LABEL;
+      optionsLabel.style.cssText = S.LABEL;
       dialog.appendChild(optionsLabel);
 
       // OCR checkbox
@@ -1502,26 +1629,26 @@ class ZoteroDJVUConverter {
       // OCR Languages container (hidden initially)
       const langContainer = doc.createElement("div");
       langContainer.id = "djvu-lang-container";
-      langContainer.style.cssText = "margin-left: 24px; margin-bottom: 12px; display: none;";
+      langContainer.style.cssText = S.INDENT + " display: none;";
 
       const langLabel = doc.createElement("div");
       langLabel.textContent = "OCR Languages:";
-      langLabel.style.cssText = "font-size: 12px; color: #666; margin-bottom: 6px;";
+      langLabel.style.cssText = S.LABEL_SMALL;
       langContainer.appendChild(langLabel);
 
       const langGrid = doc.createElement("div");
-      langGrid.style.cssText = "display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px 12px;";
+      langGrid.style.cssText = S.LANG_GRID;
 
       const languages = this.getOcrLanguages();
       const langChecks = [];
 
       for (const lang of languages) {
         const langOption = doc.createElement("label");
-        langOption.style.cssText = "display: flex; align-items: center; cursor: pointer; font-size: 12px;";
+        langOption.style.cssText = S.LANG_OPTION;
         const check = doc.createElement("input");
         check.type = "checkbox";
         check.value = lang.code;
-        check.style.cssText = "margin-right: 4px; width: 14px; height: 14px;";
+        check.style.cssText = S.CHECKBOX_SMALL;
         if (lang.code === "eng") check.checked = true;
         langOption.appendChild(check);
         langOption.appendChild(doc.createTextNode(lang.name));
@@ -1540,12 +1667,11 @@ class ZoteroDJVUConverter {
 
       // Compression dropdown
       const hasCompress = this.ocrmypdfFound;
-      const compressContainer = doc.createElement("div");
-      compressContainer.style.cssText = "margin-bottom: 16px;";
+      const compressContainer = this.createSection(doc);
 
       const compressLevelLabel = doc.createElement("div");
       compressLevelLabel.textContent = "PDF Compression:";
-      compressLevelLabel.style.cssText = ZoteroDJVUConverter.STYLES.LABEL + ` margin-bottom: 8px; ${hasCompress ? "" : "color: #999;"}`;
+      compressLevelLabel.style.cssText = S.LABEL + ` margin-bottom: 8px; ${hasCompress ? "" : "color: #999;"}`;
       compressContainer.appendChild(compressLevelLabel);
 
       const compressLevels = [
@@ -1558,43 +1684,24 @@ class ZoteroDJVUConverter {
       compressContainer.appendChild(compressSelect);
 
       if (!hasCompress) {
-        const notAvailableNote = doc.createElement("div");
-        notAvailableNote.textContent = "Install ocrmypdf to enable compression";
-        notAvailableNote.style.cssText = "font-size: 11px; color: #999; margin-top: 4px;";
-        compressContainer.appendChild(notAvailableNote);
+        compressContainer.appendChild(this.createDisabledNote(doc, "Install ocrmypdf to enable compression"));
       }
       dialog.appendChild(compressContainer);
 
       // After conversion label
       const afterLabel = doc.createElement("div");
       afterLabel.textContent = "After conversion:";
-      afterLabel.style.cssText = ZoteroDJVUConverter.STYLES.LABEL;
+      afterLabel.style.cssText = S.LABEL;
       dialog.appendChild(afterLabel);
 
-      // Replace radio
-      const replaceLabel = doc.createElement("label");
-      replaceLabel.style.cssText = "display: flex; align-items: center; margin-bottom: 8px; cursor: pointer;";
-      const replaceRadio = doc.createElement("input");
-      replaceRadio.type = "radio";
-      replaceRadio.name = "djvu-action";
-      replaceRadio.value = "replace";
-      replaceRadio.checked = true;
-      replaceRadio.style.cssText = ZoteroDJVUConverter.STYLES.CHECKBOX;
-      replaceLabel.appendChild(replaceRadio);
-      replaceLabel.appendChild(doc.createTextNode("Replace DJVU with PDF"));
-      dialog.appendChild(replaceLabel);
-
-      // Keep radio
-      const keepLabel = doc.createElement("label");
-      keepLabel.style.cssText = "display: flex; align-items: center; margin-bottom: 20px; cursor: pointer;";
-      const keepRadio = doc.createElement("input");
-      keepRadio.type = "radio";
-      keepRadio.name = "djvu-action";
-      keepRadio.value = "keep";
-      keepRadio.style.cssText = ZoteroDJVUConverter.STYLES.CHECKBOX;
-      keepLabel.appendChild(keepRadio);
-      keepLabel.appendChild(doc.createTextNode("Keep both files"));
-      dialog.appendChild(keepLabel);
+      // Replace/Keep radio group
+      const { container: radioContainer, radios } = this.createRadioGroup(doc, "djvu-action", [
+        { id: "replace", label: "Replace DJVU with PDF", checked: true },
+        { id: "keep", label: "Keep both files", last: true }
+      ]);
+      radioContainer.style.marginBottom = "20px";
+      dialog.appendChild(radioContainer);
+      const replaceRadio = radios.replace;
 
       // Cleanup function
       const cleanup = () => {
@@ -1778,15 +1885,12 @@ class ZoteroDJVUConverter {
       const existing = doc.getElementById("djvu-options-dialog");
       if (existing) existing.remove();
 
+      const S = ZoteroDJVUConverter.STYLES;
       const overlay = this.createOverlay(doc, "djvu-options-dialog");
       const dialog = this.createDialog(doc);
 
       dialog.appendChild(this.createTitle(doc, "Add OCR Layer"));
-
-      const countDiv = doc.createElement("div");
-      countDiv.textContent = `Add OCR text layer to ${fileCount} PDF files?`;
-      countDiv.style.cssText = "margin-bottom: 20px; color: #666;";
-      dialog.appendChild(countDiv);
+      dialog.appendChild(this.createMessage(doc, `Add OCR text layer to ${fileCount} PDF files?`));
 
       // Force OCR checkbox
       const { label: forceLabel, checkbox: forceCheckbox } = this.createCheckbox(
@@ -1797,23 +1901,23 @@ class ZoteroDJVUConverter {
       // Languages label
       const langLabel = doc.createElement("div");
       langLabel.textContent = "OCR Languages:";
-      langLabel.style.cssText = ZoteroDJVUConverter.STYLES.LABEL;
+      langLabel.style.cssText = S.LABEL;
       dialog.appendChild(langLabel);
 
       // Language checkboxes in a grid
       const langGrid = doc.createElement("div");
-      langGrid.style.cssText = "display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px 12px; margin-bottom: 16px;";
+      langGrid.style.cssText = S.LANG_GRID + " margin-bottom: 16px;";
 
       const languages = this.getOcrLanguages();
       const langChecks = [];
 
       for (const lang of languages) {
         const langOption = doc.createElement("label");
-        langOption.style.cssText = "display: flex; align-items: center; cursor: pointer; font-size: 12px;";
+        langOption.style.cssText = S.LANG_OPTION;
         const check = doc.createElement("input");
         check.type = "checkbox";
         check.value = lang.code;
-        check.style.cssText = "margin-right: 4px; width: 14px; height: 14px;";
+        check.style.cssText = S.CHECKBOX_SMALL;
         if (lang.code === "eng") check.checked = true;
         langOption.appendChild(check);
         langOption.appendChild(doc.createTextNode(lang.name));
@@ -1823,12 +1927,11 @@ class ZoteroDJVUConverter {
       dialog.appendChild(langGrid);
 
       // Compression dropdown
-      const compressContainer = doc.createElement("div");
-      compressContainer.style.cssText = "margin-bottom: 16px;";
+      const compressContainer = this.createSection(doc);
 
       const compressLevelLabel = doc.createElement("div");
       compressLevelLabel.textContent = "PDF Compression:";
-      compressLevelLabel.style.cssText = ZoteroDJVUConverter.STYLES.LABEL + " margin-bottom: 8px;";
+      compressLevelLabel.style.cssText = S.LABEL + " margin-bottom: 8px;";
       compressContainer.appendChild(compressLevelLabel);
 
       const compressLevels = [
@@ -2025,23 +2128,19 @@ class ZoteroDJVUConverter {
       const existing = doc.getElementById("djvu-options-dialog");
       if (existing) existing.remove();
 
+      const S = ZoteroDJVUConverter.STYLES;
       const overlay = this.createOverlay(doc, "djvu-options-dialog");
       const dialog = this.createDialog(doc);
 
       dialog.appendChild(this.createTitle(doc, "Compress PDF Files"));
-
-      const countDiv = doc.createElement("div");
-      countDiv.textContent = `Compress ${fileCount} PDF files?`;
-      countDiv.style.cssText = "margin-bottom: 20px; color: #666;";
-      dialog.appendChild(countDiv);
+      dialog.appendChild(this.createMessage(doc, `Compress ${fileCount} PDF files?`));
 
       // Compression level selector
-      const compressContainer = doc.createElement("div");
-      compressContainer.style.cssText = "margin-bottom: 16px;";
+      const compressContainer = this.createSection(doc);
 
       const levelLabel = doc.createElement("div");
       levelLabel.textContent = "Compression level:";
-      levelLabel.style.cssText = ZoteroDJVUConverter.STYLES.LABEL + " margin-bottom: 8px;";
+      levelLabel.style.cssText = S.LABEL + " margin-bottom: 8px;";
       compressContainer.appendChild(levelLabel);
 
       const levels = [
@@ -2160,40 +2259,39 @@ class ZoteroDJVUConverter {
       const existing = doc.getElementById("djvu-ocr-dialog");
       if (existing) existing.remove();
 
+      const S = ZoteroDJVUConverter.STYLES;
       const overlay = this.createOverlay(doc, "djvu-ocr-dialog");
       const dialog = this.createDialog(doc);
 
       dialog.appendChild(this.createTitle(doc, hasExistingText ? "Redo OCR" : "Add OCR Layer"));
 
       // Message
-      const message = doc.createElement("div");
       const truncatedName = this.truncateFilename(filename);
-      message.textContent = hasExistingText
+      const messageText = hasExistingText
         ? `"${truncatedName}" already appears to have text/OCR. Redo the OCR?`
         : `Add OCR text layer to "${truncatedName}"?`;
-      message.style.cssText = "margin-bottom: 20px; color: #666;";
-      dialog.appendChild(message);
+      dialog.appendChild(this.createMessage(doc, messageText));
 
       // Languages label
       const langLabel = doc.createElement("div");
       langLabel.textContent = "OCR Languages:";
-      langLabel.style.cssText = ZoteroDJVUConverter.STYLES.LABEL;
+      langLabel.style.cssText = S.LABEL;
       dialog.appendChild(langLabel);
 
       // Language checkboxes in a grid
       const langGrid = doc.createElement("div");
-      langGrid.style.cssText = "display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px 12px; margin-bottom: 16px;";
+      langGrid.style.cssText = S.LANG_GRID + " margin-bottom: 16px;";
 
       const languages = this.getOcrLanguages();
       const langChecks = [];
 
       for (const lang of languages) {
         const langOption = doc.createElement("label");
-        langOption.style.cssText = "display: flex; align-items: center; cursor: pointer; font-size: 12px;";
+        langOption.style.cssText = S.LANG_OPTION;
         const check = doc.createElement("input");
         check.type = "checkbox";
         check.value = lang.code;
-        check.style.cssText = "margin-right: 4px; width: 14px; height: 14px;";
+        check.style.cssText = S.CHECKBOX_SMALL;
         if (lang.code === "eng") check.checked = true;
         langOption.appendChild(check);
         langOption.appendChild(doc.createTextNode(lang.name));
@@ -2205,7 +2303,7 @@ class ZoteroDJVUConverter {
       // PDF Optimization dropdown (same options as other dialogs for consistency)
       const optimizeLabel = doc.createElement("div");
       optimizeLabel.textContent = "PDF Compression:";
-      optimizeLabel.style.cssText = ZoteroDJVUConverter.STYLES.LABEL + " margin-bottom: 8px;";
+      optimizeLabel.style.cssText = S.LABEL + " margin-bottom: 8px;";
       dialog.appendChild(optimizeLabel);
 
       const optimizeOptions = [
@@ -2262,22 +2360,20 @@ class ZoteroDJVUConverter {
     const doc = window.document;
 
     return new Promise((resolve) => {
+      const S = ZoteroDJVUConverter.STYLES;
       const overlay = this.createOverlay(doc, "djvu-compression-dialog-overlay");
       const dialog = this.createDialog(doc);
 
       dialog.appendChild(this.createTitle(doc, "Compress PDF"));
 
       // Message
-      const message = doc.createElement("div");
       const truncatedName = this.truncateFilename(filename);
-      message.textContent = `Compress "${truncatedName}" (${this.formatSize(fileSize)})?`;
-      message.style.cssText = "margin-bottom: 20px; color: #666;";
-      dialog.appendChild(message);
+      dialog.appendChild(this.createMessage(doc, `Compress "${truncatedName}" (${this.formatSize(fileSize)})?`));
 
       // Compression level label
       const levelLabel = doc.createElement("div");
       levelLabel.textContent = "Compression Level:";
-      levelLabel.style.cssText = ZoteroDJVUConverter.STYLES.LABEL + " margin-bottom: 8px;";
+      levelLabel.style.cssText = S.LABEL + " margin-bottom: 8px;";
       dialog.appendChild(levelLabel);
 
       // Compression level dropdown
@@ -2737,21 +2833,17 @@ class ZoteroDJVUConverter {
       const existing = doc.getElementById("djvu-options-dialog");
       if (existing) existing.remove();
 
+      const S = ZoteroDJVUConverter.STYLES;
       const overlay = this.createOverlay(doc, "djvu-options-dialog");
       const dialog = this.createDialog(doc);
 
       dialog.appendChild(this.createTitle(doc, "DJVU to PDF Converter"));
-
-      // Filename message
-      const filenameDiv = doc.createElement("div");
-      filenameDiv.textContent = `Convert "${this.truncateFilename(filename)}" to PDF?`;
-      filenameDiv.style.cssText = "margin-bottom: 20px; color: #666;";
-      dialog.appendChild(filenameDiv);
+      dialog.appendChild(this.createMessage(doc, `Convert "${this.truncateFilename(filename)}" to PDF?`));
 
       // Options label
       const optLabel = doc.createElement("div");
       optLabel.textContent = "Options:";
-      optLabel.style.cssText = ZoteroDJVUConverter.STYLES.LABEL;
+      optLabel.style.cssText = S.LABEL;
       dialog.appendChild(optLabel);
 
       // OCR checkbox
@@ -2765,27 +2857,27 @@ class ZoteroDJVUConverter {
       // OCR Languages container (hidden initially)
       const langContainer = doc.createElement("div");
       langContainer.id = "djvu-lang-container";
-      langContainer.style.cssText = "margin-left: 24px; margin-bottom: 12px; display: none;";
+      langContainer.style.cssText = S.INDENT + " display: none;";
 
       const langLabel = doc.createElement("div");
       langLabel.textContent = "OCR Languages:";
-      langLabel.style.cssText = "font-size: 12px; color: #666; margin-bottom: 6px;";
+      langLabel.style.cssText = S.LABEL_SMALL;
       langContainer.appendChild(langLabel);
 
       // Language checkboxes in a grid
       const langGrid = doc.createElement("div");
-      langGrid.style.cssText = "display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px 12px;";
+      langGrid.style.cssText = S.LANG_GRID;
 
       const languages = this.getOcrLanguages();
       const langChecks = [];
 
       for (const lang of languages) {
         const langOption = doc.createElement("label");
-        langOption.style.cssText = "display: flex; align-items: center; cursor: pointer; font-size: 12px;";
+        langOption.style.cssText = S.LANG_OPTION;
         const check = doc.createElement("input");
         check.type = "checkbox";
         check.value = lang.code;
-        check.style.cssText = "margin-right: 4px; width: 14px; height: 14px;";
+        check.style.cssText = S.CHECKBOX_SMALL;
         if (lang.code === "eng") check.checked = true;
         langOption.appendChild(check);
         langOption.appendChild(doc.createTextNode(lang.name));
@@ -2797,14 +2889,12 @@ class ZoteroDJVUConverter {
       dialog.appendChild(langContainer);
 
       // Compression dropdown (always visible, independent of OCR)
-      const compressContainer = doc.createElement("div");
-      compressContainer.style.cssText = "margin-bottom: 16px;";
-
+      const compressContainer = this.createSection(doc);
       const compressAvailable = this.ocrmypdfFound;
 
       const compressLevelLabel = doc.createElement("div");
       compressLevelLabel.textContent = "PDF Compression:";
-      compressLevelLabel.style.cssText = ZoteroDJVUConverter.STYLES.LABEL + ` margin-bottom: 8px; ${compressAvailable ? "" : "color: #999;"}`;
+      compressLevelLabel.style.cssText = S.LABEL + ` margin-bottom: 8px; ${compressAvailable ? "" : "color: #999;"}`;
       compressContainer.appendChild(compressLevelLabel);
 
       const compressLevels = [
@@ -2817,10 +2907,7 @@ class ZoteroDJVUConverter {
       compressContainer.appendChild(compressSelect);
 
       if (!compressAvailable) {
-        const notAvailableNote = doc.createElement("div");
-        notAvailableNote.textContent = "Install ocrmypdf to enable compression";
-        notAvailableNote.style.cssText = "font-size: 11px; color: #999; margin-top: 4px;";
-        compressContainer.appendChild(notAvailableNote);
+        compressContainer.appendChild(this.createDisabledNote(doc, "Install ocrmypdf to enable compression"));
       }
 
       dialog.appendChild(compressContainer);
@@ -2835,33 +2922,17 @@ class ZoteroDJVUConverter {
       // After conversion label
       const afterLabel = doc.createElement("div");
       afterLabel.textContent = "After conversion:";
-      afterLabel.style.cssText = ZoteroDJVUConverter.STYLES.LABEL;
+      afterLabel.style.cssText = S.LABEL;
       dialog.appendChild(afterLabel);
 
-      // Replace radio
-      const replaceLabel = doc.createElement("label");
-      replaceLabel.style.cssText = "display: flex; align-items: center; margin-bottom: 8px; cursor: pointer;";
-      const replaceRadio = doc.createElement("input");
-      replaceRadio.type = "radio";
-      replaceRadio.name = "djvu-action";
-      replaceRadio.value = "replace";
-      replaceRadio.checked = true;
-      replaceRadio.style.cssText = ZoteroDJVUConverter.STYLES.CHECKBOX;
-      replaceLabel.appendChild(replaceRadio);
-      replaceLabel.appendChild(doc.createTextNode("Replace DJVU with PDF"));
-      dialog.appendChild(replaceLabel);
-
-      // Keep radio
-      const keepLabel = doc.createElement("label");
-      keepLabel.style.cssText = "display: flex; align-items: center; margin-bottom: 20px; cursor: pointer;";
-      const keepRadio = doc.createElement("input");
-      keepRadio.type = "radio";
-      keepRadio.name = "djvu-action";
-      keepRadio.value = "keep";
-      keepRadio.style.cssText = ZoteroDJVUConverter.STYLES.CHECKBOX;
-      keepLabel.appendChild(keepRadio);
-      keepLabel.appendChild(doc.createTextNode("Keep both files"));
-      dialog.appendChild(keepLabel);
+      // Replace/Keep radio group
+      const { container: radioContainer, radios } = this.createRadioGroup(doc, "djvu-action", [
+        { id: "replace", label: "Replace DJVU with PDF", checked: true },
+        { id: "keep", label: "Keep both files", last: true }
+      ]);
+      radioContainer.style.marginBottom = "20px";
+      dialog.appendChild(radioContainer);
+      const replaceRadio = radios.replace;
 
       // Cleanup function
       const cleanup = () => {
@@ -2943,40 +3014,28 @@ class ZoteroDJVUConverter {
     if (existing) existing.remove();
 
     // Create non-blocking floating dialog (no overlay)
+    const S = ZoteroDJVUConverter.STYLES;
     const dialog = doc.createElement("div");
     dialog.id = "djvu-progress-dialog";
-    dialog.style.cssText = `
-      position: fixed;
-      bottom: 20px;
-      right: 20px;
-      background: white;
-      border-radius: 8px;
-      padding: 16px 20px;
-      min-width: 280px;
-      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      color: #333;
-      z-index: 10000;
-      border: 1px solid #ccc;
-    `;
+    dialog.style.cssText = S.PROGRESS_DIALOG;
 
     // Title
     const title = doc.createElement("div");
     title.textContent = "DJVU to PDF Converter";
-    title.style.cssText = "font-size: 14px; font-weight: bold; margin-bottom: 10px;";
+    title.style.cssText = S.TITLE_SMALL;
     dialog.appendChild(title);
 
     // Status text
     const statusText = doc.createElement("div");
     statusText.id = "djvu-progress-status";
     statusText.textContent = message;
-    statusText.style.cssText = "margin-bottom: 8px; color: #666; min-height: 18px; font-size: 13px;";
+    statusText.style.cssText = S.STATUS_TEXT;
     dialog.appendChild(statusText);
 
     // Queue info (hidden by default, shown when items are queued)
     const queueInfo = doc.createElement("div");
     queueInfo.id = "djvu-queue-info";
-    queueInfo.style.cssText = "margin-bottom: 12px; color: #888; font-size: 12px; display: none;";
+    queueInfo.style.cssText = S.QUEUE_INFO;
     dialog.appendChild(queueInfo);
 
     // Update queue display initially
@@ -2984,8 +3043,6 @@ class ZoteroDJVUConverter {
       queueInfo.textContent = `${this._operationQueue.length} more in queue`;
       queueInfo.style.display = "block";
     }
-
-    const S = ZoteroDJVUConverter.STYLES;
 
     // Buttons container
     const buttonsContainer = doc.createElement("div");
