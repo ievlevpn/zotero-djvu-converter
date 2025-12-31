@@ -3,6 +3,15 @@
     "djvu-converter@zotero.org": {
       "updates": [
         {
+          "version": "1.4.3",
+          "update_link": "https://github.com/ievlevpn/zotero-djvu-converter/releases/download/v1.4.3/djvu-converter-1.4.3.xpi",
+          "applications": {
+            "zotero": {
+              "strict_min_version": "7.0"
+            }
+          }
+        },
+        {
           "version": "1.4.2",
           "update_link": "https://github.com/ievlevpn/zotero-djvu-converter/releases/download/v1.4.2/djvu-converter-1.4.2.xpi",
           "applications": {

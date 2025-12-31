@@ -184,6 +184,7 @@ class ZoteroDJVUConverter {
     this.ocrmypdfPath = null;
     this._menuPopupHandler = null;
     this._isProcessing = false; // Prevent concurrent conversions
+    this._processingItemIds = new Set(); // Track items being processed to prevent duplicate notifier calls
     this._searchPaths = null; // Cached search paths
   }
 
@@ -1523,6 +1524,12 @@ class ZoteroDJVUConverter {
     try {
       this.log(`Checking item ID: ${id}`);
 
+      // Prevent duplicate processing of the same item (Zotero may fire multiple events)
+      if (this._processingItemIds.has(id)) {
+        this.log(`Item ${id} is already being processed, skipping duplicate notifier call`);
+        return;
+      }
+
       const item = await Zotero.Items.getAsync(id);
       if (!item) {
         this.log(`Item ${id} not found`);
@@ -1542,7 +1549,13 @@ class ZoteroDJVUConverter {
         return;
       }
 
-      await this.processAttachment(item);
+      // Mark item as being processed
+      this._processingItemIds.add(id);
+      try {
+        await this.processAttachment(item, true); // true = called from notifier (silent mode)
+      } finally {
+        this._processingItemIds.delete(id);
+      }
     } catch (e) {
       this.log(`Error processing item ${id}: ${e.message}\n${e.stack}`);
     }
@@ -1901,9 +1914,14 @@ class ZoteroDJVUConverter {
     return filePath;
   }
 
-  async processAttachment(item) {
+  async processAttachment(item, silentMode = false) {
     // Prevent concurrent conversions
     if (this._isProcessing) {
+      // In silent mode (called from notifier), just skip without showing error
+      if (silentMode) {
+        this.log("Skipping: another conversion is already in progress (silent mode)");
+        return;
+      }
       Services.prompt.alert(
         null,
         "DJVU to PDF Converter",
