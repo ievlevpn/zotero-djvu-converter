@@ -1102,9 +1102,9 @@ class ZoteroDJVUConverter {
     try {
       if (!this.pdfinfoPath) return null;
 
-      const tempFile = pdfPath + ".pagecount";
-      const escapedPdf = this.escapeShellPath(pdfPath);
-      const escapedTemp = this.escapeShellPath(tempFile);
+      // Use temp directory for output file with safe name
+      const tempDir = Zotero.getTempDirectory().path;
+      const tempFile = PathUtils.join(tempDir, `djvu_conv_pagecount_${Date.now()}.txt`);
 
       if (this.isWindows()) {
         // Windows: use findstr instead of grep
@@ -1114,9 +1114,9 @@ class ZoteroDJVUConverter {
         const cmd = `"${escapedToolWin}" "${escapedPdfWin}" 2>nul | findstr /i "^Pages:" > "${escapedTempWin}"`;
         await Zotero.Utilities.Internal.exec("cmd.exe", ["/c", cmd]);
       } else {
-        // Set LANG for UTF-8 support (needed for non-ASCII filenames like Cyrillic)
+        // pdfPath is now a safe temp path with ASCII-only characters, no escaping needed
         await Zotero.Utilities.Internal.exec("/bin/sh", ["-c",
-          `export LANG=en_US.UTF-8; "${this.pdfinfoPath}" "${escapedPdf}" 2>/dev/null | grep -i "^Pages:" > "${escapedTemp}"`
+          `export LANG=en_US.UTF-8; "${this.pdfinfoPath}" "${pdfPath}" 2>/dev/null | grep -i "^Pages:" > "${tempFile}"`
         ]);
       }
 
@@ -2699,12 +2699,16 @@ class ZoteroDJVUConverter {
 
             if (self._pendingAutoConvertItems.length > 0) {
               self._autoConvertTimer = setTimeout(async () => {
-                const items = self._pendingAutoConvertItems.slice(); // Copy array
-                self._pendingAutoConvertItems = []; // Clear pending
-                self._autoConvertTimer = null;
+                try {
+                  const items = self._pendingAutoConvertItems.slice(); // Copy array
+                  self._pendingAutoConvertItems = []; // Clear pending
+                  self._autoConvertTimer = null;
 
-                self.log(`Debounce complete: processing ${items.length} DJVU file(s)`);
-                await self.handleAutoConvert(items);
+                  self.log(`Debounce complete: processing ${items.length} DJVU file(s)`);
+                  await self.handleAutoConvert(items);
+                } catch (e) {
+                  self.log(`Error in auto-convert timer: ${e.message}`);
+                }
               }, DEBOUNCE_MS);
             }
           }
@@ -3434,15 +3438,16 @@ class ZoteroDJVUConverter {
     return { statusText, pageInfo };
   }
 
-  // Clean up OCR marker and log files
-  async cleanupOcrMarkerFiles(outputPath) {
-    if (!outputPath) return;
+  // Clean up OCR marker and log files by tempId
+  async cleanupOcrMarkerFiles(tempId) {
+    if (!tempId) return;
 
+    const tempDir = Zotero.getTempDirectory().path;
     const files = [
-      outputPath + ".done",
-      outputPath + ".error",
-      outputPath + ".log",
-      outputPath + ".pid"
+      PathUtils.join(tempDir, `${tempId}.done`),
+      PathUtils.join(tempDir, `${tempId}.error`),
+      PathUtils.join(tempDir, `${tempId}.log`),
+      PathUtils.join(tempDir, `${tempId}.pid`)
     ];
     for (const file of files) {
       try { await IOUtils.remove(file); } catch (e) {}
@@ -3452,27 +3457,55 @@ class ZoteroDJVUConverter {
   async runOcrWithProgress(inputPath, outputPath, progress, forceOcr = false, languages = "eng", pageCount = null, optimizeLevel = 1, skipOcr = false, getBatchPrefix = () => "") {
     const modeDesc = skipOcr ? "compression-only" : (forceOcr ? "force-OCR" : "OCR");
     this.log(`Starting ${modeDesc} process...`);
+
+    // Use temp directory with safe ASCII filenames to avoid shell escaping issues
+    // with special characters (brackets, !, Cyrillic, etc.) in original paths
+    const tempDir = Zotero.getTempDirectory().path;
+    const tempId = `djvu_conv_ocr_${Date.now()}`;
+    const tempInputPath = PathUtils.join(tempDir, `${tempId}_input.pdf`);
+    const tempOutputPath = PathUtils.join(tempDir, `${tempId}_output.pdf`);
+    const errorLogFile = PathUtils.join(tempDir, `${tempId}.log`);
+    const pidFile = PathUtils.join(tempDir, `${tempId}.pid`);
+    const markerFile = PathUtils.join(tempDir, `${tempId}.done`);
+    const errorFile = PathUtils.join(tempDir, `${tempId}.error`);
+
+    // Copy input file to temp location with safe name
+    try {
+      await IOUtils.copy(inputPath, tempInputPath);
+      this.log(`Copied input to temp: ${tempInputPath}`);
+    } catch (e) {
+      throw new Error(`Failed to copy input file: ${e.message}`);
+    }
+
+    // Get page count from temp file (after copy, so path is safe for shell)
+    // This overrides any passed pageCount since that may have failed with special chars
+    const actualPageCount = await this.getPdfPageCount(tempInputPath);
+    if (actualPageCount) {
+      pageCount = actualPageCount;
+    }
     this.log(`Languages: ${languages}, pages: ${pageCount || "unknown"}, optimize: -O ${optimizeLevel}, skipOcr: ${skipOcr}`);
 
-    // File paths for tracking
-    const errorLogFile = outputPath + ".log";
-    const pidFile = outputPath + ".pid";
-    const markerFile = outputPath + ".done";
-    const errorFile = outputPath + ".error";
-
-    // Build command using helper
-    const ocrCmd = this.buildOcrmypdfCommand(inputPath, outputPath, errorLogFile, {
+    // Build command using helper with safe temp paths
+    const ocrCmd = this.buildOcrmypdfCommand(tempInputPath, tempOutputPath, errorLogFile, {
       forceOcr, languages, optimizeLevel, skipOcr
     });
     this.log(`OCR command: ${ocrCmd}`);
 
     // Clean up any leftover files from previous cancelled runs
-    await this.cleanupOcrMarkerFiles(outputPath);
+    await this.cleanupOcrMarkerFiles(tempId);
+    try { await IOUtils.remove(tempOutputPath); } catch (e) {}
     try { await IOUtils.remove(outputPath); } catch (e) {}
 
     // Start background process
     this.startBackgroundProcess(ocrCmd, markerFile, errorFile, pidFile);
     this._activeProcesses.set(pidFile, "ocrmypdf");
+
+    // Helper to clean up all temp files
+    const cleanupTempFiles = async () => {
+      try { await IOUtils.remove(tempInputPath); } catch (e) {}
+      try { await IOUtils.remove(tempOutputPath); } catch (e) {}
+      await this.cleanupOcrMarkerFiles(tempId);
+    };
 
     // Poll for completion with progress updates
     return new Promise((resolve, reject) => {
@@ -3480,75 +3513,91 @@ class ZoteroDJVUConverter {
       const maxWait = ZoteroDJVUConverter.TIMEOUT_OCR;
 
       const checkInterval = setInterval(async () => {
-        // Check if cancelled
-        if (progress.cancelled) {
-          clearInterval(checkInterval);
-          await this.killBackgroundProcess(pidFile, "ocrmypdf");
-          this._activeProcesses.delete(pidFile);
-          if (this.isWindows()) {
-            try {
-              await Zotero.Utilities.Internal.exec("cmd.exe", ["/c", "taskkill /F /IM tesseract.exe 2>nul"]);
-            } catch (e) {}
-          }
-          await this.cleanupOcrMarkerFiles(outputPath);
-          try { await IOUtils.remove(outputPath); } catch (e) {}
-          this.log("OCR cancelled by user");
-          reject(new Error("Cancelled by user"));
-          return;
-        }
-
-        const elapsed = Date.now() - startTime;
-        const elapsedSec = Math.floor(elapsed / 1000);
-
-        // Parse progress from log file using helper
-        const { statusText, pageInfo } = await this.parseOcrProgress(errorLogFile, pageCount, skipOcr);
-        progress.updateText(`${getBatchPrefix()}${statusText}${pageInfo} • ${elapsedSec}s`);
-
-        // Check if done
-        let done = false;
-        let error = false;
-
-        try { done = await IOUtils.exists(markerFile); } catch (e) {}
-        try { error = await IOUtils.exists(errorFile); } catch (e) {}
-
-        if (done) {
-          clearInterval(checkInterval);
-          this._activeProcesses.delete(pidFile);
-          await this.cleanupOcrMarkerFiles(outputPath);
-          progress.setProgress(79);
-          const completeMsg = skipOcr ? "Compression complete!" :
-            optimizeLevel > 0 ? "OCR & optimization complete!" : "OCR complete!";
-          progress.updateText(completeMsg);
-          this.log(skipOcr ? "Compression completed successfully" : "OCR completed successfully");
-          resolve(true);
-        } else if (error) {
-          clearInterval(checkInterval);
-          this._activeProcesses.delete(pidFile);
-          const modeLabel = skipOcr ? "Compression" : "OCR";
-          let errorMsg = `${modeLabel} processing failed`;
-          try {
-            const logContent = await Zotero.File.getContentsAsync(errorLogFile);
-            if (logContent && logContent.trim()) {
-              const lines = logContent.trim().split("\n");
-              errorMsg = lines.slice(-3).join(" ").substring(0, 200);
+        try {
+          // Check if cancelled
+          if (progress.cancelled) {
+            clearInterval(checkInterval);
+            await this.killBackgroundProcess(pidFile, "ocrmypdf");
+            this._activeProcesses.delete(pidFile);
+            if (this.isWindows()) {
+              try {
+                await Zotero.Utilities.Internal.exec("cmd.exe", ["/c", "taskkill /F /IM tesseract.exe 2>nul"]);
+              } catch (e) {}
             }
-          } catch (e) {}
-          await this.cleanupOcrMarkerFiles(outputPath);
-          this.log(`${modeLabel} failed: ${errorMsg}`);
-          reject(new Error(errorMsg));
-        } else if (elapsed >= maxWait) {
-          clearInterval(checkInterval);
-          await this.killBackgroundProcess(pidFile, "ocrmypdf");
-          this._activeProcesses.delete(pidFile);
-          if (this.isWindows()) {
-            try {
-              await Zotero.Utilities.Internal.exec("cmd.exe", ["/c", "taskkill /F /IM tesseract.exe 2>nul"]);
-            } catch (e) {}
+            await cleanupTempFiles();
+            this.log("OCR cancelled by user");
+            reject(new Error("Cancelled by user"));
+            return;
           }
-          await this.cleanupOcrMarkerFiles(outputPath);
-          const modeLabel = skipOcr ? "Compression" : "OCR";
-          this.log(`${modeLabel} timeout after ${elapsedSec} seconds`);
-          reject(new Error(`${modeLabel} timed out after 10 minutes`));
+
+          const elapsed = Date.now() - startTime;
+          const elapsedSec = Math.floor(elapsed / 1000);
+
+          // Parse progress from log file using helper
+          const { statusText, pageInfo } = await this.parseOcrProgress(errorLogFile, pageCount, skipOcr);
+          progress.updateText(`${getBatchPrefix()}${statusText}${pageInfo} • ${elapsedSec}s`);
+
+          // Check if done
+          let done = false;
+          let error = false;
+
+          try { done = await IOUtils.exists(markerFile); } catch (e) {}
+          try { error = await IOUtils.exists(errorFile); } catch (e) {}
+
+          if (done) {
+            clearInterval(checkInterval);
+            this._activeProcesses.delete(pidFile);
+            // Copy temp output to final destination
+            try {
+              await IOUtils.copy(tempOutputPath, outputPath);
+              this.log(`Copied output to: ${outputPath}`);
+            } catch (e) {
+              await cleanupTempFiles();
+              this.log(`Failed to copy output: ${e.message}`);
+              reject(new Error(`Failed to save PDF: ${e.message}`));
+              return;
+            }
+            await cleanupTempFiles();
+            progress.setProgress(79);
+            const completeMsg = skipOcr ? "Compression complete!" :
+              optimizeLevel > 0 ? "OCR & optimization complete!" : "OCR complete!";
+            progress.updateText(completeMsg);
+            this.log(skipOcr ? "Compression completed successfully" : "OCR completed successfully");
+            resolve(true);
+          } else if (error) {
+            clearInterval(checkInterval);
+            this._activeProcesses.delete(pidFile);
+            const modeLabel = skipOcr ? "Compression" : "OCR";
+            let errorMsg = `${modeLabel} processing failed`;
+            try {
+              const logContent = await Zotero.File.getContentsAsync(errorLogFile);
+              if (logContent && logContent.trim()) {
+                const lines = logContent.trim().split("\n");
+                errorMsg = lines.slice(-3).join(" ").substring(0, 200);
+              }
+            } catch (e) {}
+            await cleanupTempFiles();
+            this.log(`${modeLabel} failed: ${errorMsg}`);
+            reject(new Error(errorMsg));
+          } else if (elapsed >= maxWait) {
+            clearInterval(checkInterval);
+            await this.killBackgroundProcess(pidFile, "ocrmypdf");
+            this._activeProcesses.delete(pidFile);
+            if (this.isWindows()) {
+              try {
+                await Zotero.Utilities.Internal.exec("cmd.exe", ["/c", "taskkill /F /IM tesseract.exe 2>nul"]);
+              } catch (e) {}
+            }
+            await cleanupTempFiles();
+            const modeLabel = skipOcr ? "Compression" : "OCR";
+            this.log(`${modeLabel} timeout after ${elapsedSec} seconds`);
+            reject(new Error(`${modeLabel} timed out after 10 minutes`));
+          }
+        } catch (e) {
+          clearInterval(checkInterval);
+          this.log(`Error in OCR polling: ${e.message}`);
+          await cleanupTempFiles();
+          reject(e);
         }
       }, ZoteroDJVUConverter.POLL_INTERVAL_SLOW);
     });
@@ -3586,10 +3635,8 @@ class ZoteroDJVUConverter {
         cmd = `"${escapedTool}" "${escapedInput}" -e "n" > "${escapedTemp}" 2>&1`;
         await Zotero.Utilities.Internal.exec("cmd.exe", ["/c", cmd]);
       } else {
-        const escapedInput = this.escapeShellPath(inputPath);
-        const escapedTemp = this.escapeShellPath(tempFile);
-        // Set LANG for UTF-8 support (needed for non-ASCII filenames like Cyrillic)
-        cmd = `export LANG=en_US.UTF-8; "${djvusedPath}" "${escapedInput}" -e 'n' > "${escapedTemp}" 2>&1`;
+        // inputPath is now a safe temp path with ASCII-only characters, no escaping needed
+        cmd = `export LANG=en_US.UTF-8; "${djvusedPath}" "${inputPath}" -e 'n' > "${tempFile}" 2>&1`;
         await Zotero.Utilities.Internal.exec("/bin/sh", ["-c", cmd]);
       }
 
@@ -3621,122 +3668,152 @@ class ZoteroDJVUConverter {
       throw new Error("Missing input or output path");
     }
 
-    // Get page count first for progress display
-    const totalPages = await this.getDjvuPageCount(inputPath);
+    this.log("Starting DJVU conversion...");
+
+    // Use temp directory with safe ASCII filenames to avoid shell escaping issues
+    // with special characters (brackets, !, Cyrillic, etc.) in original paths
+    const tempDir = Zotero.getTempDirectory().path;
+    const tempId = `djvu_conv_${Date.now()}`;
+    const tempInputPath = PathUtils.join(tempDir, `${tempId}_input.djvu`);
+    const tempOutputPath = PathUtils.join(tempDir, `${tempId}_output.pdf`);
+    const markerFile = PathUtils.join(tempDir, `${tempId}.done`);
+    const errorFile = PathUtils.join(tempDir, `${tempId}.error`);
+    const pidFile = PathUtils.join(tempDir, `${tempId}.pid`);
+    const logFile = PathUtils.join(tempDir, `${tempId}.log`);
+
+    // Copy input file to temp location with safe name
+    try {
+      await IOUtils.copy(inputPath, tempInputPath);
+      this.log(`Copied input to temp: ${tempInputPath}`);
+    } catch (e) {
+      throw new Error(`Failed to copy input file: ${e.message}`);
+    }
+
+    // Get page count from temp file (after copy, so path is safe for shell)
+    const totalPages = await this.getDjvuPageCount(tempInputPath);
     if (totalPages) {
       this.log(`DJVU has ${totalPages} pages`);
     }
-
-    this.log("Starting DJVU conversion...");
-
-    const markerFile = outputPath + ".done";
-    const errorFile = outputPath + ".error";
-    const pidFile = outputPath + ".pid";
-    const logFile = outputPath + ".log";
 
     // Clean up any leftover files from previous cancelled runs
     try { await IOUtils.remove(markerFile); } catch (e) {}
     try { await IOUtils.remove(errorFile); } catch (e) {}
     try { await IOUtils.remove(logFile); } catch (e) {}
     try { await IOUtils.remove(pidFile); } catch (e) {}
+    try { await IOUtils.remove(tempOutputPath); } catch (e) {}
     try { await IOUtils.remove(outputPath); } catch (e) {}
 
     // Build the ddjvu command with -verbose for progress (cross-platform)
+    // Using temp paths which only contain safe ASCII characters
     let ddjvuCmd;
     if (this.isWindows()) {
-      const escapedInput = this.escapeWindowsPath(inputPath);
-      const escapedOutput = this.escapeWindowsPath(outputPath);
+      const escapedInput = this.escapeWindowsPath(tempInputPath);
+      const escapedOutput = this.escapeWindowsPath(tempOutputPath);
       const escapedTool = this.escapeWindowsPath(this.ddjvuPath);
       const escapedLog = this.escapeWindowsPath(logFile);
       ddjvuCmd = `"${escapedTool}" -format=pdf -verbose "${escapedInput}" "${escapedOutput}" 2>"${escapedLog}"`;
     } else {
-      const escapedInput = this.escapeShellPath(inputPath);
-      const escapedOutput = this.escapeShellPath(outputPath);
-      const escapedLog = this.escapeShellPath(logFile);
-      // Set LANG for UTF-8 support (needed for non-ASCII filenames like Cyrillic)
-      ddjvuCmd = `export LANG=en_US.UTF-8; "${this.ddjvuPath}" -format=pdf -verbose "${escapedInput}" "${escapedOutput}" 2>"${escapedLog}"`;
+      // Temp paths are safe ASCII, no escaping needed but we still quote them
+      ddjvuCmd = `export LANG=en_US.UTF-8; "${this.ddjvuPath}" -format=pdf -verbose "${tempInputPath}" "${tempOutputPath}" 2>"${logFile}"`;
     }
 
     // Start background process using helper
     this.startBackgroundProcess(ddjvuCmd, markerFile, errorFile, pidFile);
     this._activeProcesses.set(pidFile, "ddjvu");
 
+    // Helper to clean up all temp files
+    const cleanupTempFiles = async () => {
+      try { await IOUtils.remove(tempInputPath); } catch (e) {}
+      try { await IOUtils.remove(tempOutputPath); } catch (e) {}
+      try { await IOUtils.remove(markerFile); } catch (e) {}
+      try { await IOUtils.remove(errorFile); } catch (e) {}
+      try { await IOUtils.remove(logFile); } catch (e) {}
+      try { await IOUtils.remove(pidFile); } catch (e) {}
+    };
+
     return new Promise((resolve, reject) => {
       const startTime = Date.now();
       const maxWait = ZoteroDJVUConverter.TIMEOUT_CONVERSION;
 
       const checkInterval = setInterval(async () => {
-        if (progress.cancelled) {
-          clearInterval(checkInterval);
-          await this.killBackgroundProcess(pidFile, "ddjvu");
-          this._activeProcesses.delete(pidFile);
-          try { await IOUtils.remove(markerFile); } catch (e) {}
-          try { await IOUtils.remove(errorFile); } catch (e) {}
-          try { await IOUtils.remove(logFile); } catch (e) {}
-          try { await IOUtils.remove(outputPath); } catch (e) {}
-          this.log("DJVU conversion cancelled");
-          reject(new Error("Cancelled by user"));
-          return;
-        }
-
-        const elapsed = Date.now() - startTime;
-        const elapsedSec = Math.floor(elapsed / 1000);
-
-        // Parse log file for page progress
-        let pageInfo = "";
         try {
-          const logContent = await Zotero.File.getContentsAsync(logFile);
-          const pageMatches = logContent.match(/-------- page (\d+) -------/g);
-          if (pageMatches && pageMatches.length > 0) {
-            const lastMatch = pageMatches[pageMatches.length - 1];
-            const currentPage = lastMatch.match(/page (\d+)/)[1];
-            pageInfo = totalPages ? ` • page ${currentPage}/${totalPages}` : ` • page ${currentPage}`;
+          if (progress.cancelled) {
+            clearInterval(checkInterval);
+            await this.killBackgroundProcess(pidFile, "ddjvu");
+            this._activeProcesses.delete(pidFile);
+            await cleanupTempFiles();
+            this.log("DJVU conversion cancelled");
+            reject(new Error("Cancelled by user"));
+            return;
           }
-        } catch (e) {
-          // Log file might not exist yet
-        }
 
-        progress.updateText(`${getBatchPrefix()}Converting DJVU to PDF${pageInfo} • ${elapsedSec}s`);
+          const elapsed = Date.now() - startTime;
+          const elapsedSec = Math.floor(elapsed / 1000);
 
-        let done = false;
-        let error = false;
-
-        try { done = await IOUtils.exists(markerFile); } catch (e) {}
-        try { error = await IOUtils.exists(errorFile); } catch (e) {}
-
-        if (done) {
-          clearInterval(checkInterval);
-          this._activeProcesses.delete(pidFile);
-          try { await IOUtils.remove(markerFile); } catch (e) {}
-          try { await IOUtils.remove(errorFile); } catch (e) {}
-          try { await IOUtils.remove(logFile); } catch (e) {}
-          try { await IOUtils.remove(pidFile); } catch (e) {}
-          this.log("DJVU conversion complete");
-          resolve(true);
-        } else if (error) {
-          clearInterval(checkInterval);
-          this._activeProcesses.delete(pidFile);
-          // Log file contents for debugging before cleanup
+          // Parse log file for page progress
+          let pageInfo = "";
           try {
             const logContent = await Zotero.File.getContentsAsync(logFile);
-            this.log(`DJVU log file content (last 500 chars): ${logContent ? logContent.slice(-500) : 'empty'}`);
+            const pageMatches = logContent.match(/-------- page (\d+) -------/g);
+            if (pageMatches && pageMatches.length > 0) {
+              const lastMatch = pageMatches[pageMatches.length - 1];
+              const currentPage = lastMatch.match(/page (\d+)/)[1];
+              pageInfo = totalPages ? ` • page ${currentPage}/${totalPages}` : ` • page ${currentPage}`;
+            }
           } catch (e) {
-            this.log(`Could not read log file: ${e.message}`);
+            // Log file might not exist yet
           }
-          try { await IOUtils.remove(errorFile); } catch (e) {}
-          try { await IOUtils.remove(logFile); } catch (e) {}
-          try { await IOUtils.remove(pidFile); } catch (e) {}
-          this.log("DJVU conversion failed");
-          reject(new Error("DJVU conversion failed - check if file is corrupted"));
-        } else if (elapsed >= maxWait) {
+
+          progress.updateText(`${getBatchPrefix()}Converting DJVU to PDF${pageInfo} • ${elapsedSec}s`);
+
+          let done = false;
+          let error = false;
+
+          try { done = await IOUtils.exists(markerFile); } catch (e) {}
+          try { error = await IOUtils.exists(errorFile); } catch (e) {}
+
+          if (done) {
+            clearInterval(checkInterval);
+            this._activeProcesses.delete(pidFile);
+            // Copy temp output to final destination
+            try {
+              await IOUtils.copy(tempOutputPath, outputPath);
+              this.log(`Copied output to: ${outputPath}`);
+            } catch (e) {
+              await cleanupTempFiles();
+              this.log(`Failed to copy output: ${e.message}`);
+              reject(new Error(`Failed to save PDF: ${e.message}`));
+              return;
+            }
+            await cleanupTempFiles();
+            this.log("DJVU conversion complete");
+            resolve(true);
+          } else if (error) {
+            clearInterval(checkInterval);
+            this._activeProcesses.delete(pidFile);
+            // Log file contents for debugging before cleanup
+            try {
+              const logContent = await Zotero.File.getContentsAsync(logFile);
+              this.log(`DJVU log file content (last 500 chars): ${logContent ? logContent.slice(-500) : 'empty'}`);
+            } catch (e) {
+              this.log(`Could not read log file: ${e.message}`);
+            }
+            await cleanupTempFiles();
+            this.log("DJVU conversion failed");
+            reject(new Error("DJVU conversion failed - check if file is corrupted"));
+          } else if (elapsed >= maxWait) {
+            clearInterval(checkInterval);
+            await this.killBackgroundProcess(pidFile, "ddjvu");
+            this._activeProcesses.delete(pidFile);
+            await cleanupTempFiles();
+            this.log("DJVU conversion timeout");
+            reject(new Error("DJVU conversion timed out"));
+          }
+        } catch (e) {
           clearInterval(checkInterval);
-          await this.killBackgroundProcess(pidFile, "ddjvu");
-          this._activeProcesses.delete(pidFile);
-          try { await IOUtils.remove(markerFile); } catch (e) {}
-          try { await IOUtils.remove(errorFile); } catch (e) {}
-          try { await IOUtils.remove(logFile); } catch (e) {}
-          this.log("DJVU conversion timeout");
-          reject(new Error("DJVU conversion timed out"));
+          this.log(`Error in DJVU polling: ${e.message}`);
+          await cleanupTempFiles();
+          reject(e);
         }
       }, ZoteroDJVUConverter.POLL_INTERVAL_FAST);
     });
