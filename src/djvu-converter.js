@@ -188,6 +188,418 @@ class ZoteroDJVUConverter {
     this._processingItemIds = new Set(); // Track items being processed to prevent duplicate notifier calls
     this._searchPaths = null; // Cached search paths
     this._activeProcesses = new Map(); // Track active background processes: pidFile -> processPattern
+
+    // Operation queue system
+    this._operationQueue = []; // Pending operations: {type, items, options, resolve, reject}
+    this._currentOperation = null; // Currently running operation
+    this._globalFileOffset = 0; // Files completed before current operation
+
+    // Auto-convert debounce system - collect files over a time window
+    this._pendingAutoConvertItems = []; // DJVU items waiting to be processed
+    this._autoConvertTimer = null; // Debounce timer
+  }
+
+  // Queue an operation or run immediately if nothing is running
+  async enqueueOperation(type, items, options = {}) {
+    return new Promise((resolve, reject) => {
+      const operation = { type, items, options, resolve, reject };
+
+      if (this._currentOperation) {
+        // Something is running, add to queue
+        this._operationQueue.push(operation);
+        this.log(`Queued ${type} operation (${items.length} items). Queue size: ${this._operationQueue.length}`);
+        this.updateQueueDisplay();
+      } else {
+        // Nothing running, reset offset and start immediately
+        this._globalFileOffset = 0;
+        this.runOperation(operation);
+      }
+    });
+  }
+
+  // Run a single operation
+  async runOperation(operation) {
+    this._currentOperation = operation;
+
+    // Calculate global totals for progress display
+    const globalTotal = this._globalFileOffset + this.getTotalFilesInQueue();
+    const globalOffset = this._globalFileOffset;
+
+    this.log(`Starting ${operation.type} operation (${operation.items.length} items, global ${globalOffset + 1}-${globalOffset + operation.items.length}/${globalTotal})`);
+
+    try {
+      let result;
+      switch (operation.type) {
+        case "convert":
+          result = await this.executeConversion(operation.items, operation.options, globalOffset, globalTotal);
+          break;
+        case "ocr":
+          result = await this.executeOcr(operation.items, operation.options, globalOffset, globalTotal);
+          break;
+        case "compress":
+          result = await this.executeCompress(operation.items, operation.options, globalOffset, globalTotal);
+          break;
+        default:
+          throw new Error(`Unknown operation type: ${operation.type}`);
+      }
+      operation.resolve(result);
+    } catch (e) {
+      this.log(`Operation ${operation.type} failed: ${e.message}`);
+      operation.reject(e);
+    } finally {
+      // Update offset for next operation
+      this._globalFileOffset += operation.items.length;
+      this._currentOperation = null;
+      this.processNextInQueue();
+    }
+  }
+
+  // Process next item in queue
+  processNextInQueue() {
+    if (this._operationQueue.length > 0) {
+      const next = this._operationQueue.shift();
+      this.log(`Processing next in queue: ${next.type} (${this._operationQueue.length} remaining)`);
+      this.runOperation(next);
+    }
+  }
+
+  // Update queue count in progress dialog
+  updateQueueDisplay() {
+    const win = Zotero.getMainWindow();
+    if (!win) return;
+
+    const queueInfo = win.document.getElementById("djvu-queue-info");
+    const cancelAllBtn = win.document.getElementById("djvu-cancel-all-btn");
+    const statusText = win.document.getElementById("djvu-progress-status");
+
+    if (this._operationQueue.length > 0) {
+      const queuedFiles = this._operationQueue.reduce((sum, op) => sum + op.items.length, 0);
+
+      if (queueInfo) {
+        queueInfo.textContent = `${queuedFiles} more in queue`;
+        queueInfo.style.display = "block";
+      }
+      if (cancelAllBtn) cancelAllBtn.style.display = "inline-flex";
+
+      // Update the [X/Y] in status text with new total
+      if (statusText && this._currentOperation) {
+        const newTotal = this._globalFileOffset + this.getTotalFilesInQueue();
+        const currentFileNum = this._globalFileOffset + 1;
+        const currentText = statusText.textContent;
+
+        // Only show [X/Y] if total > 1 and fileNum is valid
+        if (newTotal > 1 && currentFileNum <= newTotal) {
+          // Check if there's already a [X/Y] pattern
+          if (/\[\d+\/\d+\]/.test(currentText)) {
+            // Replace [X/oldTotal] with [X/newTotal], but ensure X doesn't exceed newTotal
+            statusText.textContent = currentText.replace(/\[(\d+)\/\d+\]/, (match, x) => {
+              const fileNum = parseInt(x, 10);
+              if (fileNum <= newTotal) return `[${fileNum}/${newTotal}]`;
+              return match; // Keep original if invalid
+            });
+          } else {
+            // No pattern yet - add [fileNum/newTotal] prefix
+            statusText.textContent = `[${currentFileNum}/${newTotal}] ${currentText}`;
+          }
+        }
+      }
+    } else {
+      if (queueInfo) queueInfo.style.display = "none";
+      if (cancelAllBtn) cancelAllBtn.style.display = "none";
+    }
+  }
+
+  // Cancel current operation and clear queue
+  cancelAllOperations() {
+    this.log("Cancelling all operations");
+
+    // Clear queue first
+    const queuedCount = this._operationQueue.length;
+    for (const op of this._operationQueue) {
+      op.reject(new Error("Cancelled by user"));
+    }
+    this._operationQueue = [];
+
+    if (queuedCount > 0) {
+      this.log(`Cleared ${queuedCount} queued operations`);
+    }
+
+    // Current operation cancel is handled by the progress controller
+    return queuedCount;
+  }
+
+  // Get queue status
+  getQueueStatus() {
+    return {
+      isRunning: this._currentOperation !== null,
+      currentType: this._currentOperation?.type || null,
+      queueLength: this._operationQueue.length
+    };
+  }
+
+  // Get total file count across current operation and queue
+  getTotalFilesInQueue() {
+    let total = 0;
+    if (this._currentOperation) {
+      total += this._currentOperation.items.length;
+    }
+    for (const op of this._operationQueue) {
+      total += op.items.length;
+    }
+    return total;
+  }
+
+  // Execute conversion operation (called by queue system)
+  async executeConversion(items, options, globalOffset = 0, globalTotal = null) {
+    const fileCount = items.length;
+    this.log(`Executing conversion for ${fileCount} file(s)`);
+    this._isProcessing = true;
+    let progress = null;
+    let successCount = 0;
+    let failCount = 0;
+
+    // Helper to get current total (dynamic - updates as queue changes)
+    const getTotal = () => globalOffset + this.getTotalFilesInQueue();
+
+    try {
+      const total = getTotal();
+      const globalNum = globalOffset + 1;
+      progress = this.showProgress(total === 1 ? "Starting conversion..." : `[${globalNum}/${total}] Converting...`);
+
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        const globalFileNum = globalOffset + i + 1;
+        const currentTotal = getTotal();
+
+        if (progress.cancelled) {
+          this.log("Conversion cancelled by user");
+          break;
+        }
+
+        try {
+          const filePath = await this.validateDjvuAttachment(item);
+          if (!filePath) {
+            failCount++;
+            continue;
+          }
+
+          const filename = this.truncateFilename(item.getField("title") || this.getBasename(filePath) || "file.djvu", 30);
+          const getBatchPrefix = () => {
+            const total = getTotal();
+            // Never show [1/1] - only show prefix when there's more than 1 file total
+            if (total <= 1 || globalFileNum > total) return "";
+            return `[${globalFileNum}/${total}] `;
+          };
+          progress.updateText(`${getBatchPrefix()}Converting: ${filename}`);
+
+          await this.convertSingleDjvu(item, filePath, options, progress, globalFileNum, getBatchPrefix);
+          successCount++;
+        } catch (e) {
+          this.log(`Error converting file ${globalFileNum}: ${e.message}`);
+          if (e.message.includes("Cancelled by user") || progress.cancelled) {
+            break;
+          }
+          failCount++;
+        }
+      }
+
+      // Show summary (only if this is the last operation or queue is empty)
+      const hasMoreQueued = this._operationQueue.length > 0;
+      if (!hasMoreQueued) {
+        const finalTotal = getTotal();
+        if (finalTotal === 1) {
+          if (progress.cancelled) {
+            progress.finish(false, "Conversion cancelled");
+          } else if (successCount === 1) {
+            progress.finish(true, "Converted successfully");
+          } else {
+            progress.finish(false, "Conversion failed");
+          }
+        } else {
+          const totalSuccess = globalOffset + successCount;
+          if (progress.cancelled) {
+            progress.finish(false, `Cancelled after ${totalSuccess}/${finalTotal}`);
+          } else if (failCount === 0) {
+            progress.finish(true, `All ${finalTotal} files converted`);
+          } else {
+            progress.finish(false, `Done: ${successCount} converted, ${failCount} failed`);
+          }
+        }
+      }
+
+      return { successCount, failCount };
+    } finally {
+      this._isProcessing = false;
+    }
+  }
+
+  // Execute OCR operation (called by queue system)
+  async executeOcr(items, options, globalOffset = 0, globalTotal = null) {
+    const fileCount = items.length;
+    this.log(`Executing OCR for ${fileCount} file(s)`);
+    this._isProcessing = true;
+    let progress = null;
+    let successCount = 0;
+    let failCount = 0;
+
+    // Helper to get current total (dynamic - updates as queue changes)
+    const getTotal = () => globalOffset + this.getTotalFilesInQueue();
+
+    try {
+      const total = getTotal();
+      const globalNum = globalOffset + 1;
+      progress = this.showProgress(total === 1 ? "Adding OCR layer..." : `[${globalNum}/${total}] Adding OCR...`);
+
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        const globalFileNum = globalOffset + i + 1;
+        const currentTotal = getTotal();
+
+        if (progress.cancelled) {
+          this.log("OCR cancelled by user");
+          break;
+        }
+
+        try {
+          const filePath = await item.getFilePathAsync();
+          if (!filePath) {
+            failCount++;
+            continue;
+          }
+
+          const filename = this.truncateFilename(item.getField("title") || this.getBasename(filePath) || "file.pdf", 30);
+          const getBatchPrefix = () => {
+            const total = getTotal();
+            // Never show [1/1] - only show prefix when there's more than 1 file total
+            if (total <= 1 || globalFileNum > total) return "";
+            return `[${globalFileNum}/${total}] `;
+          };
+          progress.updateText(`${getBatchPrefix()}OCR: ${filename}`);
+
+          await this.ocrSinglePdf(item, filePath, options, progress, globalFileNum, getBatchPrefix);
+          successCount++;
+        } catch (e) {
+          this.log(`Error adding OCR to file ${globalFileNum}: ${e.message}`);
+          if (e.message.includes("Cancelled by user") || progress.cancelled) {
+            break;
+          }
+          failCount++;
+        }
+      }
+
+      // Show summary (only if this is the last operation or queue is empty)
+      const hasMoreQueued = this._operationQueue.length > 0;
+      if (!hasMoreQueued) {
+        const finalTotal = getTotal();
+        if (finalTotal === 1) {
+          if (progress.cancelled) {
+            progress.finish(false, "OCR cancelled");
+          } else if (successCount === 1) {
+            progress.finish(true, "OCR added successfully");
+          } else {
+            progress.finish(false, "OCR failed");
+          }
+        } else {
+          const totalSuccess = globalOffset + successCount;
+          if (progress.cancelled) {
+            progress.finish(false, `Cancelled after ${totalSuccess}/${finalTotal}`);
+          } else if (failCount === 0) {
+            progress.finish(true, `OCR added to all ${finalTotal} files`);
+          } else {
+            progress.finish(false, `Done: ${successCount} processed, ${failCount} failed`);
+          }
+        }
+      }
+
+      return { successCount, failCount };
+    } finally {
+      this._isProcessing = false;
+    }
+  }
+
+  // Execute compression operation (called by queue system)
+  async executeCompress(items, options, globalOffset = 0, globalTotal = null) {
+    const fileCount = items.length;
+    this.log(`Executing compression for ${fileCount} file(s)`);
+    this._isProcessing = true;
+    let progress = null;
+    let successCount = 0;
+    let failCount = 0;
+
+    // Helper to get current total (dynamic - updates as queue changes)
+    const getTotal = () => globalOffset + this.getTotalFilesInQueue();
+
+    try {
+      const total = getTotal();
+      const globalNum = globalOffset + 1;
+      progress = this.showProgress(total === 1 ? "Compressing PDF..." : `[${globalNum}/${total}] Compressing...`);
+
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        const globalFileNum = globalOffset + i + 1;
+        const currentTotal = getTotal();
+
+        if (progress.cancelled) {
+          this.log("Compression cancelled by user");
+          break;
+        }
+
+        try {
+          const filePath = await item.getFilePathAsync();
+          if (!filePath) {
+            failCount++;
+            continue;
+          }
+
+          const filename = this.truncateFilename(item.getField("title") || this.getBasename(filePath) || "file.pdf", 30);
+          const getBatchPrefix = () => {
+            const total = getTotal();
+            // Never show [1/1] - only show prefix when there's more than 1 file total
+            // Also safeguard: only show if fileNum makes sense
+            if (total <= 1 || globalFileNum > total) return "";
+            return `[${globalFileNum}/${total}] `;
+          };
+          progress.updateText(`${getBatchPrefix()}Compressing: ${filename}`);
+
+          await this.compressSinglePdf(item, filePath, options.compressLevel, progress, globalFileNum, getBatchPrefix);
+          successCount++;
+        } catch (e) {
+          this.log(`Error compressing file ${globalFileNum}: ${e.message}`);
+          if (e.message.includes("Cancelled by user") || progress.cancelled) {
+            break;
+          }
+          failCount++;
+        }
+      }
+
+      // Show summary (only if this is the last operation or queue is empty)
+      const hasMoreQueued = this._operationQueue.length > 0;
+      if (!hasMoreQueued) {
+        const finalTotal = getTotal();
+        if (finalTotal === 1) {
+          if (progress.cancelled) {
+            progress.finish(false, "Compression cancelled");
+          } else if (successCount === 1) {
+            progress.finish(true, "Compressed successfully");
+          } else {
+            progress.finish(false, "Compression failed");
+          }
+        } else {
+          const totalSuccess = globalOffset + successCount;
+          if (progress.cancelled) {
+            progress.finish(false, `Cancelled after ${totalSuccess}/${finalTotal}`);
+          } else if (failCount === 0) {
+            progress.finish(true, `All ${finalTotal} files compressed`);
+          } else {
+            progress.finish(false, `Done: ${successCount} compressed, ${failCount} failed`);
+          }
+        }
+      }
+
+      return { successCount, failCount };
+    } finally {
+      this._isProcessing = false;
+    }
   }
 
   // Get platform-specific search paths for executables
@@ -483,8 +895,49 @@ class ZoteroDJVUConverter {
       .replace(/"/g, '""');   // Escape double quotes by doubling
   }
 
+  // Clean up orphaned temp files from previous crashes
+  // Only cleans up files with our unique prefix (djvu_conv_) older than 1 hour
+  async cleanupOrphanedTempFiles() {
+    try {
+      const tempDir = Zotero.getTempDirectory().path;
+      const entries = await IOUtils.getChildren(tempDir);
+      const now = Date.now();
+      const ONE_HOUR = 60 * 60 * 1000;
+      let cleanedCount = 0;
+
+      for (const entryPath of entries) {
+        try {
+          const filename = PathUtils.filename(entryPath);
+
+          // Only clean up files with our unique prefix
+          if (!filename.startsWith("djvu_conv_")) continue;
+
+          // Only clean up files older than 1 hour to avoid deleting active operation files
+          const stat = await IOUtils.stat(entryPath);
+          const fileAge = now - stat.lastModified;
+
+          if (fileAge > ONE_HOUR) {
+            await IOUtils.remove(entryPath, { ignoreAbsent: true });
+            cleanedCount++;
+          }
+        } catch (e) {
+          // Ignore errors for individual files
+        }
+      }
+
+      if (cleanedCount > 0) {
+        this.log(`Cleaned up ${cleanedCount} orphaned temp file(s)`);
+      }
+    } catch (e) {
+      this.log(`Error cleaning up temp files: ${e.message}`);
+    }
+  }
+
   async init() {
     this.log("Initializing...");
+
+    // Clean up orphaned temp files from previous crashes
+    await this.cleanupOrphanedTempFiles();
 
     try {
       // Find tools using `which` command
@@ -563,7 +1016,7 @@ class ZoteroDJVUConverter {
     try {
       // Write output to a temp file since exec doesn't return stdout
       const tempDir = Zotero.getTempDirectory().path;
-      const tempFile = PathUtils.join(tempDir, `which_${name}_${Date.now()}.txt`);
+      const tempFile = PathUtils.join(tempDir, `djvu_conv_which_${name}_${Date.now()}.txt`);
 
       if (this.isWindows()) {
         // Windows: Use 'where' command and also check common paths directly
@@ -711,6 +1164,13 @@ class ZoteroDJVUConverter {
 
   async shutdown() {
     this.log("Shutting down...");
+
+    // Clear auto-convert timer and pending items
+    if (this._autoConvertTimer) {
+      clearTimeout(this._autoConvertTimer);
+      this._autoConvertTimer = null;
+    }
+    this._pendingAutoConvertItems = [];
 
     // Kill all active background processes
     if (this._activeProcesses && this._activeProcesses.size > 0) {
@@ -913,16 +1373,6 @@ class ZoteroDJVUConverter {
     this.log(`Selected items: ${items ? items.length : 0}`);
     if (!items || items.length === 0) return;
 
-    // Prevent concurrent conversions
-    if (this._isProcessing) {
-      Services.prompt.alert(
-        null,
-        "DJVU to PDF Converter",
-        "Another conversion is already in progress.\n\nPlease wait for it to complete."
-      );
-      return;
-    }
-
     // Check if ddjvu is available
     if (!this.ddjvuFound) {
       Services.prompt.alert(
@@ -937,10 +1387,13 @@ class ZoteroDJVUConverter {
     }
 
     // Collect all DJVU attachments
-    const djvuItems = this.collectAttachments(items, (item) => {
+    let djvuItems = this.collectAttachments(items, (item) => {
       const filename = (item.attachmentFilename || "").toLowerCase();
       return filename.endsWith(".djvu") || filename.endsWith(".djv");
     });
+
+    // Filter out items already being processed
+    djvuItems = djvuItems.filter(item => !this._processingItemIds.has(item.id));
 
     // Check if any DJVU files found
     if (djvuItems.length === 0) {
@@ -965,31 +1418,19 @@ class ZoteroDJVUConverter {
       return;
     }
 
-    // For single file, use processAttachment (shows filename in dialog)
-    if (djvuItems.length === 1) {
-      await this.processAttachment(djvuItems[0]);
-      return;
-    }
-
-    // For multiple files, show batch dialog and process all with same settings
-    await this.processBatchConversion(djvuItems);
-  }
-
-  async processBatchConversion(djvuItems) {
-    const fileCount = djvuItems.length;
-    this.log(`Starting batch conversion for ${fileCount} files`);
-
-    // Show options dialog for batch conversion
+    // Show options dialog (single or batch)
     let options;
-    try {
-      options = await this.showBatchOptionsDialog(fileCount);
-    } catch (e) {
-      this.log(`Error showing batch dialog: ${e.message}\n${e.stack}`);
-      Services.prompt.alert(null, "DJVU to PDF Converter - Error", `Failed to show options dialog: ${e.message}`);
-      return;
+    if (djvuItems.length === 1) {
+      const item = djvuItems[0];
+      const filePath = await item.getFilePathAsync();
+      const filename = item.getField("title") || this.getBasename(filePath) || "file.djvu";
+      options = await this.showOptionsDialog(filename);
+    } else {
+      options = await this.showBatchOptionsDialog(djvuItems.length);
     }
+
     if (!options) {
-      this.log("User cancelled batch conversion");
+      this.log("User cancelled conversion");
       return;
     }
 
@@ -1013,75 +1454,10 @@ class ZoteroDJVUConverter {
       options.addOcr = false;
     }
 
-    this.log(`Batch options: OCR=${options.addOcr}, compressLevel=${options.compressLevel}, deleteOriginal=${options.deleteOriginal}`);
+    this.log(`Options: OCR=${options.addOcr}, compressLevel=${options.compressLevel}, deleteOriginal=${options.deleteOriginal}`);
 
-    // Mark as processing
-    this._isProcessing = true;
-    let progress = null;
-    let successCount = 0;
-    let failCount = 0;
-
-    try {
-      progress = this.showProgress(`Converting 0/${fileCount} files...`);
-
-      for (let i = 0; i < djvuItems.length; i++) {
-        const item = djvuItems[i];
-        const fileNum = i + 1;
-
-        // Check if cancelled
-        if (progress.cancelled) {
-          this.log("Batch conversion cancelled by user");
-          break;
-        }
-
-        try {
-          const filePath = await this.validateDjvuAttachment(item);
-          if (!filePath) {
-            failCount++;
-            continue;
-          }
-
-          const filename = this.truncateFilename(item.getField("title") || this.getBasename(filePath) || "file.djvu", 30);
-          progress.updateText(`Converting ${fileNum}/${fileCount}: ${filename}`);
-
-          await this.convertSingleDjvu(item, filePath, options, progress, fileNum, fileCount);
-          successCount++;
-        } catch (e) {
-          this.log(`Error converting file ${fileNum}: ${e.message}`);
-          // Don't count user cancellation as failure
-          if (e.message.includes("Cancelled by user") || progress.cancelled) {
-            break;
-          }
-          failCount++;
-        }
-      }
-
-      // Show summary
-      const skippedCount = fileCount - successCount - failCount;
-      if (progress.cancelled) {
-        let msg = `Cancelled: ${successCount} converted`;
-        if (failCount > 0) msg += `, ${failCount} failed`;
-        if (skippedCount > 0) msg += `, ${skippedCount} skipped`;
-        progress.finish(false, msg);
-      } else if (failCount === 0) {
-        progress.finish(true, `All ${successCount} files converted successfully`);
-      } else if (successCount === 0) {
-        progress.finish(false, `Failed: all ${failCount} files failed to convert`);
-      } else {
-        progress.finish(false, `Done: ${successCount} converted, ${failCount} failed`);
-      }
-
-    } catch (e) {
-      this.log(`Batch conversion error: ${e.message}`);
-      if (progress) progress.finish(false, "Batch conversion failed");
-      Services.prompt.alert(
-        null,
-        "DJVU to PDF Converter - Error",
-        `Batch conversion failed:\n\n${e.message}`
-      );
-    } finally {
-      this._isProcessing = false;
-    }
+    // Queue or execute the conversion
+    await this.enqueueOperation("convert", djvuItems, options);
   }
 
   showBatchOptionsDialog(fileCount) {
@@ -1272,16 +1648,6 @@ class ZoteroDJVUConverter {
     const items = zoteroPane.getSelectedItems();
     if (!items || items.length === 0) return;
 
-    // Prevent concurrent operations
-    if (this._isProcessing) {
-      Services.prompt.alert(
-        null,
-        "DJVU to PDF Converter",
-        "Another operation is already in progress.\n\nPlease wait for it to complete."
-      );
-      return;
-    }
-
     // Check dependencies
     if (!this.ocrmypdfFound || !this.tesseractFound) {
       let missingDeps = [];
@@ -1300,11 +1666,14 @@ class ZoteroDJVUConverter {
     }
 
     // Collect all PDF attachments
-    const pdfItems = this.collectAttachments(items, (item) => {
+    let pdfItems = this.collectAttachments(items, (item) => {
       const contentType = item.attachmentContentType;
       const filename = (item.attachmentFilename || "").toLowerCase();
       return contentType === "application/pdf" || filename.endsWith(".pdf");
     });
+
+    // Filter out items already being processed
+    pdfItems = pdfItems.filter(item => !this._processingItemIds.has(item.id));
 
     // Check if any PDF files found
     if (pdfItems.length === 0) {
@@ -1329,100 +1698,38 @@ class ZoteroDJVUConverter {
       return;
     }
 
-    // For single file, use existing method
+    // Show options dialog (single or batch)
+    let options;
     if (pdfItems.length === 1) {
-      await this.addOcrToExistingPdf(pdfItems[0]);
-      return;
+      const item = pdfItems[0];
+      const filePath = await item.getFilePathAsync();
+      const filename = item.getField("title") || this.getBasename(filePath) || "file.pdf";
+      // Check if PDF already has text/OCR to show appropriate dialog
+      const hasExistingText = await this.checkPdfHasText(filePath);
+      options = await this.showOcrOptionsDialog(filename, hasExistingText);
+      // If PDF has existing text and user didn't check forceOcr, set it based on dialog context
+      if (options && hasExistingText) {
+        options.forceOcr = true;
+      }
+    } else {
+      options = await this.showBatchOcrOptionsDialog(pdfItems.length);
     }
 
-    // For multiple files, use batch processing
-    await this.processBatchOcr(pdfItems);
-  }
-
-  async processBatchOcr(pdfItems) {
-    const fileCount = pdfItems.length;
-
-    // Show batch OCR options dialog
-    const options = await this.showBatchOcrOptionsDialog(fileCount);
     if (!options) {
-      this.log("User cancelled batch OCR");
+      this.log("User cancelled OCR");
       return;
     }
 
-    this.log(`Batch OCR options: forceOcr=${options.forceOcr}, languages=${options.languages}, optimizeLevel=${options.optimizeLevel}`);
+    this.log(`OCR options: forceOcr=${options.forceOcr}, languages=${options.languages}, optimizeLevel=${options.optimizeLevel}`);
 
-    // Mark as processing
-    this._isProcessing = true;
-    let progress = null;
-    let successCount = 0;
-    let failCount = 0;
-
-    try {
-      progress = this.showProgress(`Adding OCR to 0/${fileCount} files...`);
-
-      for (let i = 0; i < pdfItems.length; i++) {
-        const item = pdfItems[i];
-        const fileNum = i + 1;
-
-        if (progress.cancelled) {
-          this.log("Batch OCR cancelled by user");
-          break;
-        }
-
-        try {
-          const filePath = await item.getFilePathAsync();
-          if (!filePath) {
-            failCount++;
-            continue;
-          }
-
-          const filename = this.truncateFilename(item.getField("title") || this.getBasename(filePath) || "file.pdf", 30);
-          progress.updateText(`[${fileNum}/${fileCount}] OCR: ${filename}`);
-
-          await this.ocrSinglePdf(item, filePath, options, progress, fileNum, fileCount);
-          successCount++;
-        } catch (e) {
-          this.log(`Error processing file ${fileNum}: ${e.message}`);
-          if (e.message.includes("Cancelled by user") || progress.cancelled) {
-            break;
-          }
-          failCount++;
-        }
-      }
-
-      // Show summary
-      const skippedCount = fileCount - successCount - failCount;
-      if (progress.cancelled) {
-        let msg = `Cancelled: ${successCount} processed`;
-        if (failCount > 0) msg += `, ${failCount} failed`;
-        if (skippedCount > 0) msg += `, ${skippedCount} skipped`;
-        progress.finish(false, msg);
-      } else if (failCount === 0) {
-        progress.finish(true, `All ${successCount} files processed successfully`);
-      } else if (successCount === 0) {
-        progress.finish(false, `Failed: all ${failCount} files failed`);
-      } else {
-        progress.finish(false, `Done: ${successCount} processed, ${failCount} failed`);
-      }
-
-    } catch (e) {
-      this.log(`Batch OCR error: ${e.message}`);
-      if (progress) progress.finish(false, "Batch OCR failed");
-      Services.prompt.alert(
-        null,
-        "DJVU to PDF Converter - Error",
-        `Batch OCR failed:\n\n${e.message}`
-      );
-    } finally {
-      this._isProcessing = false;
-    }
+    // Queue or execute the OCR operation
+    await this.enqueueOperation("ocr", pdfItems, options);
   }
 
-  async ocrSinglePdf(item, filePath, options, progress, fileNum, totalFiles) {
+  async ocrSinglePdf(item, filePath, options, progress, fileNum, getBatchPrefix) {
     const filename = this.getBasename(filePath);
-    this.log(`OCR file ${fileNum}/${totalFiles}: ${filename}`);
+    this.log(`OCR file ${fileNum}: ${filename}`);
 
-    const batchPrefix = `[${fileNum}/${totalFiles}] `;
     const ocrPdfPath = filePath.replace(/\.pdf$/i, "_ocr.pdf");
     const pageCount = await this.getPdfPageCount(filePath);
 
@@ -1436,7 +1743,7 @@ class ZoteroDJVUConverter {
         pageCount,
         options.optimizeLevel,
         false,
-        batchPrefix
+        getBatchPrefix
       );
 
       if (ocrSuccess && Zotero.File.pathToFile(ocrPdfPath).exists()) {
@@ -1583,16 +1890,6 @@ class ZoteroDJVUConverter {
     const items = zoteroPane.getSelectedItems();
     if (!items || items.length === 0) return;
 
-    // Prevent concurrent operations
-    if (this._isProcessing) {
-      Services.prompt.alert(
-        null,
-        "DJVU to PDF Converter",
-        "Another operation is already in progress.\n\nPlease wait for it to complete."
-      );
-      return;
-    }
-
     // Check dependencies (ocrmypdf handles compression via optimization)
     if (!this.ocrmypdfFound) {
       Services.prompt.alert(
@@ -1607,11 +1904,14 @@ class ZoteroDJVUConverter {
     }
 
     // Collect all PDF attachments
-    const pdfItems = this.collectAttachments(items, (item) => {
+    let pdfItems = this.collectAttachments(items, (item) => {
       const contentType = item.attachmentContentType;
       const filename = (item.attachmentFilename || "").toLowerCase();
       return contentType === "application/pdf" || filename.endsWith(".pdf");
     });
+
+    // Filter out items already being processed
+    pdfItems = pdfItems.filter(item => !this._processingItemIds.has(item.id));
 
     // Check if any PDF files found
     if (pdfItems.length === 0) {
@@ -1636,101 +1936,33 @@ class ZoteroDJVUConverter {
       return;
     }
 
-    // For single file, use existing method
+    // Show options dialog (single or batch)
+    let compressLevel;
     if (pdfItems.length === 1) {
-      await this.compressExistingPdf(pdfItems[0]);
+      const item = pdfItems[0];
+      const filePath = await item.getFilePathAsync();
+      const filename = item.getField("title") || this.getBasename(filePath) || "file.pdf";
+      const fileSize = this.getFileSize(filePath);
+      compressLevel = await this.showCompressionOptionsDialog(filename, fileSize);
+    } else {
+      compressLevel = await this.showBatchCompressionOptionsDialog(pdfItems.length);
+    }
+
+    if (!compressLevel) {
+      this.log("User cancelled compression");
       return;
     }
 
-    // For multiple files, use batch processing
-    await this.processBatchCompress(pdfItems);
+    this.log(`Compression level: ${compressLevel}`);
+
+    // Queue or execute the compression operation
+    await this.enqueueOperation("compress", pdfItems, { compressLevel });
   }
 
-  async processBatchCompress(pdfItems) {
-    const fileCount = pdfItems.length;
-
-    // Show batch compression options dialog
-    const compressionLevel = await this.showBatchCompressionOptionsDialog(fileCount);
-    if (!compressionLevel) {
-      this.log("User cancelled batch compression");
-      return;
-    }
-
-    const optimizeLevel = ZoteroDJVUConverter.getOptimizeLevel(compressionLevel);
-    this.log(`Batch compression: level=${compressionLevel}, optimize=${optimizeLevel}`);
-
-    // Mark as processing
-    this._isProcessing = true;
-    let progress = null;
-    let successCount = 0;
-    let failCount = 0;
-
-    try {
-      progress = this.showProgress(`Compressing 0/${fileCount} files...`);
-
-      for (let i = 0; i < pdfItems.length; i++) {
-        const item = pdfItems[i];
-        const fileNum = i + 1;
-
-        if (progress.cancelled) {
-          this.log("Batch compression cancelled by user");
-          break;
-        }
-
-        try {
-          const filePath = await item.getFilePathAsync();
-          if (!filePath) {
-            failCount++;
-            continue;
-          }
-
-          const filename = this.truncateFilename(item.getField("title") || this.getBasename(filePath) || "file.pdf", 30);
-          progress.updateText(`[${fileNum}/${fileCount}] Compressing: ${filename}`);
-
-          await this.compressSinglePdf(item, filePath, optimizeLevel, progress, fileNum, fileCount);
-          successCount++;
-        } catch (e) {
-          this.log(`Error compressing file ${fileNum}: ${e.message}`);
-          if (e.message.includes("Cancelled by user") || progress.cancelled) {
-            break;
-          }
-          failCount++;
-        }
-      }
-
-      // Show summary
-      const skippedCount = fileCount - successCount - failCount;
-      if (progress.cancelled) {
-        let msg = `Cancelled: ${successCount} compressed`;
-        if (failCount > 0) msg += `, ${failCount} failed`;
-        if (skippedCount > 0) msg += `, ${skippedCount} skipped`;
-        progress.finish(false, msg);
-      } else if (failCount === 0) {
-        progress.finish(true, `All ${successCount} files compressed successfully`);
-      } else if (successCount === 0) {
-        progress.finish(false, `Failed: all ${failCount} files failed`);
-      } else {
-        progress.finish(false, `Done: ${successCount} compressed, ${failCount} failed`);
-      }
-
-    } catch (e) {
-      this.log(`Batch compression error: ${e.message}`);
-      if (progress) progress.finish(false, "Batch compression failed");
-      Services.prompt.alert(
-        null,
-        "DJVU to PDF Converter - Error",
-        `Batch compression failed:\n\n${e.message}`
-      );
-    } finally {
-      this._isProcessing = false;
-    }
-  }
-
-  async compressSinglePdf(item, filePath, optimizeLevel, progress, fileNum, totalFiles) {
+  async compressSinglePdf(item, filePath, optimizeLevel, progress, fileNum, getBatchPrefix) {
     const filename = this.getBasename(filePath);
-    this.log(`Compressing file ${fileNum}/${totalFiles}: ${filename}`);
+    this.log(`Compressing file ${fileNum}: ${filename}`);
 
-    const batchPrefix = `[${fileNum}/${totalFiles}] `;
     const compressedPath = filePath.replace(/\.pdf$/i, "_compressed.pdf");
     const pageCount = await this.getPdfPageCount(filePath);
 
@@ -1744,7 +1976,7 @@ class ZoteroDJVUConverter {
         pageCount,
         optimizeLevel,
         true,       // skipOcr - only compress, no OCR
-        batchPrefix
+        getBatchPrefix
       );
 
       if (success && Zotero.File.pathToFile(compressedPath).exists()) {
@@ -2341,16 +2573,47 @@ class ZoteroDJVUConverter {
     }
 
     const self = this;
+    const DEBOUNCE_MS = 200; // Collect files for 0.2 seconds before showing dialog
 
     const callback = {
       notify: async function (event, type, ids, extraData) {
-        self.log(`Notifier triggered: event=${event}, type=${type}, ids=${JSON.stringify(ids)}`);
+        try {
+          self.log(`Notifier triggered: event=${event}, type=${type}, ids=${JSON.stringify(ids)}`);
 
-        if (event === "add" && type === "item") {
-          for (const id of ids) {
-            await Zotero.Promise.delay(500);
-            await self.handleItemAdded(id);
+          if (event === "add" && type === "item") {
+            // Wait a bit for Zotero to finish processing the items
+            await Zotero.Promise.delay(300);
+
+            // Check each item and add valid DJVU files to pending list
+            for (const id of ids) {
+              const item = await self.getDjvuItemIfValid(id);
+              if (item) {
+                // Avoid duplicates
+                if (!self._pendingAutoConvertItems.some(i => i.id === item.id)) {
+                  self._pendingAutoConvertItems.push(item);
+                  self.log(`Added DJVU to pending list: ${item.getField("title")} (${self._pendingAutoConvertItems.length} pending)`);
+                }
+              }
+            }
+
+            // Reset debounce timer - process after DEBOUNCE_MS of no new files
+            if (self._autoConvertTimer) {
+              clearTimeout(self._autoConvertTimer);
+            }
+
+            if (self._pendingAutoConvertItems.length > 0) {
+              self._autoConvertTimer = setTimeout(async () => {
+                const items = self._pendingAutoConvertItems.slice(); // Copy array
+                self._pendingAutoConvertItems = []; // Clear pending
+                self._autoConvertTimer = null;
+
+                self.log(`Debounce complete: processing ${items.length} DJVU file(s)`);
+                await self.handleAutoConvert(items);
+              }, DEBOUNCE_MS);
+            }
           }
+        } catch (e) {
+          self.log(`Error in notifier callback: ${e.message}`);
         }
       },
     };
@@ -2359,45 +2622,105 @@ class ZoteroDJVUConverter {
     this.log(`Notifier registered with ID: ${this.notifierID}`);
   }
 
-  async handleItemAdded(id) {
+  // Check if an item ID is a valid DJVU attachment for auto-conversion
+  async getDjvuItemIfValid(id) {
     try {
-      this.log(`Checking item ID: ${id}`);
-
-      // Prevent duplicate processing of the same item (Zotero may fire multiple events)
+      // Prevent duplicate processing
       if (this._processingItemIds.has(id)) {
-        this.log(`Item ${id} is already being processed, skipping duplicate notifier call`);
-        return;
+        this.log(`Item ${id} is already being processed, skipping`);
+        return null;
       }
 
       const item = await Zotero.Items.getAsync(id);
-      if (!item) {
-        this.log(`Item ${id} not found`);
-        return;
+      if (!item || item.deleted || !item.isAttachment()) {
+        return null;
       }
 
-      // Skip items in trash
-      if (item.deleted) {
-        this.log(`Item ${id} is in trash, skipping`);
-        return;
+      // Check if it's a DJVU file
+      const filePath = await this.validateDjvuAttachment(item);
+      if (!filePath) {
+        return null;
       }
 
-      this.log(`Item type: ${item.itemType}, isAttachment: ${item.isAttachment()}`);
+      this.log(`DJVU file detected: ${item.getField("title") || this.getBasename(filePath)}`);
+      return item;
+    } catch (e) {
+      this.log(`Error checking item ${id}: ${e.message}`);
+      return null;
+    }
+  }
 
-      if (!item.isAttachment()) {
-        this.log("Not an attachment, skipping");
+  // Handle automatic conversion of DJVU files added to library
+  async handleAutoConvert(djvuItems) {
+    if (djvuItems.length === 0) return;
+
+    // Check if ddjvu is available
+    if (!this.ddjvuFound) {
+      Services.prompt.alert(
+        null,
+        "DJVU to PDF Converter - Error",
+        "Cannot convert: ddjvu (djvulibre) is not installed.\n\n" +
+        "Please install it with:\n" +
+        this.getInstallInstructions("djvulibre") + "\n\n" +
+        "Then restart Zotero."
+      );
+      return;
+    }
+
+    // Show options dialog (single or batch)
+    let options;
+    if (djvuItems.length === 1) {
+      const item = djvuItems[0];
+      const filePath = await item.getFilePathAsync();
+      const filename = item.getField("title") || this.getBasename(filePath) || "file.djvu";
+      options = await this.showOptionsDialog(filename);
+    } else {
+      options = await this.showBatchOptionsDialog(djvuItems.length);
+    }
+
+    if (!options) {
+      this.log("User cancelled conversion");
+      return;
+    }
+
+    // Warn if OCR requested but dependencies not available
+    if (options.addOcr && (!this.ocrmypdfFound || !this.tesseractFound)) {
+      let missingDeps = [];
+      if (!this.ocrmypdfFound) missingDeps.push("ocrmypdf");
+      if (!this.tesseractFound) missingDeps.push("tesseract");
+
+      const continueWithoutOcr = Services.prompt.confirm(
+        null,
+        "DJVU to PDF Converter - Warning",
+        `OCR dependencies missing: ${missingDeps.join(", ")}\n\n` +
+        "To enable OCR, install with:\n" +
+        this.getInstallInstructions(["ocrmypdf", "tesseract", "tesseract-lang"]) + "\n\n" +
+        "Continue conversion without OCR?"
+      );
+      if (!continueWithoutOcr) {
         return;
       }
+      options.addOcr = false;
+    }
 
-      // Mark item as being processed
+    this.log(`Auto-convert options: OCR=${options.addOcr}, compressLevel=${options.compressLevel}, deleteOriginal=${options.deleteOriginal}`);
+
+    // Mark items as being processed to prevent duplicate handling
+    const itemIds = djvuItems.map(item => item.id);
+    for (const id of itemIds) {
       this._processingItemIds.add(id);
-      try {
-        await this.processAttachment(item, true); // true = called from notifier (silent mode)
-      } finally {
+    }
+
+    // Queue the conversion operation
+    await this.enqueueOperation("convert", djvuItems, options);
+
+    // Clear processing markers after a delay to prevent race conditions
+    // The delay ensures the queue has time to start processing before IDs are cleared
+    setTimeout(() => {
+      for (const id of itemIds) {
         this._processingItemIds.delete(id);
       }
-    } catch (e) {
-      this.log(`Error processing item ${id}: ${e.message}\n${e.stack}`);
-    }
+    }, 60000); // 60 seconds should be plenty for queue to pick up items
   }
 
   showOptionsDialog(filename) {
@@ -2645,18 +2968,52 @@ class ZoteroDJVUConverter {
 
     // Status text
     const statusText = doc.createElement("div");
+    statusText.id = "djvu-progress-status";
     statusText.textContent = message;
-    statusText.style.cssText = "margin-bottom: 12px; color: #666; min-height: 18px; font-size: 13px;";
+    statusText.style.cssText = "margin-bottom: 8px; color: #666; min-height: 18px; font-size: 13px;";
     dialog.appendChild(statusText);
 
-    // Cancel button (danger style, full width)
+    // Queue info (hidden by default, shown when items are queued)
+    const queueInfo = doc.createElement("div");
+    queueInfo.id = "djvu-queue-info";
+    queueInfo.style.cssText = "margin-bottom: 12px; color: #888; font-size: 12px; display: none;";
+    dialog.appendChild(queueInfo);
+
+    // Update queue display initially
+    if (this._operationQueue.length > 0) {
+      queueInfo.textContent = `${this._operationQueue.length} more in queue`;
+      queueInfo.style.display = "block";
+    }
+
+    const S = ZoteroDJVUConverter.STYLES;
+
+    // Buttons container
+    const buttonsContainer = doc.createElement("div");
+    buttonsContainer.style.cssText = "display: flex; gap: 8px;";
+
+    // Cancel Current button
     const cancelBtn = doc.createElement("button");
     cancelBtn.textContent = "Cancel";
-    const S = ZoteroDJVUConverter.STYLES;
-    cancelBtn.style.cssText = S.BUTTON_BASE + S.BUTTON_DANGER + " width: 100%; padding: 8px 16px;";
+    cancelBtn.style.cssText = S.BUTTON_BASE + S.BUTTON_DANGER + " flex: 1; padding: 8px 16px;";
     cancelBtn.onmouseenter = () => { cancelBtn.style.background = "linear-gradient(to bottom, #ee3333, #aa0000)"; };
     cancelBtn.onmouseleave = () => { cancelBtn.style.background = "linear-gradient(to bottom, #ff4444, #cc0000)"; };
-    dialog.appendChild(cancelBtn);
+    buttonsContainer.appendChild(cancelBtn);
+
+    // Cancel All button (only visible when queue has items)
+    const cancelAllBtn = doc.createElement("button");
+    cancelAllBtn.id = "djvu-cancel-all-btn";
+    cancelAllBtn.textContent = "Cancel All";
+    cancelAllBtn.style.cssText = S.BUTTON_BASE + S.BUTTON_SECONDARY + " padding: 8px 12px; display: none;";
+    cancelAllBtn.onmouseenter = () => { cancelAllBtn.style.background = "linear-gradient(to bottom, #e8e8e8, #d8d8d8)"; };
+    cancelAllBtn.onmouseleave = () => { cancelAllBtn.style.background = "linear-gradient(to bottom, #f8f8f8, #e8e8e8)"; };
+    buttonsContainer.appendChild(cancelAllBtn);
+
+    // Show Cancel All button if queue has items
+    if (this._operationQueue.length > 0) {
+      cancelAllBtn.style.display = "inline-flex";
+    }
+
+    dialog.appendChild(buttonsContainer);
 
     doc.documentElement.appendChild(dialog);
 
@@ -2672,21 +3029,33 @@ class ZoteroDJVUConverter {
       },
       setProgress: (percent) => {}, // No-op for backward compatibility
       finish: (success, msg) => {
-        if (controller.cancelled || !dialog.parentNode) return;
+        if (controller.finished || !dialog.parentNode) return;
         controller.finished = true;
+
+        // If cancelled, just close the dialog immediately
+        if (controller.cancelled) {
+          dialog.remove();
+          return;
+        }
+
         statusText.textContent = msg || (success ? "Done!" : "Failed");
         statusText.style.color = success ? "#00aa00" : "#cc0000";
 
-        // Switch to secondary style
+        // Hide queue info and Cancel All button
+        queueInfo.style.display = "none";
+        cancelAllBtn.style.display = "none";
+
+        // Switch to secondary style - button becomes "Close"
         cancelBtn.textContent = "Close";
-        cancelBtn.style.cssText = S.BUTTON_BASE + S.BUTTON_SECONDARY + " width: 100%; padding: 8px 16px;";
+        cancelBtn.style.cssText = S.BUTTON_BASE + S.BUTTON_SECONDARY + " flex: 1; padding: 8px 16px;";
+        cancelBtn.style.opacity = "1";
         cancelBtn.onmouseenter = () => { cancelBtn.style.background = "linear-gradient(to bottom, #e8e8e8, #d8d8d8)"; };
         cancelBtn.onmouseleave = () => { cancelBtn.style.background = "linear-gradient(to bottom, #f8f8f8, #e8e8e8)"; };
       },
       close: () => { if (dialog.parentNode) dialog.remove(); }
     };
 
-    // Cancel button handler
+    // Cancel current operation button handler
     cancelBtn.onclick = () => {
       if (!dialog.parentNode) return;
       if (controller.cancelled || controller.finished) {
@@ -2696,7 +3065,25 @@ class ZoteroDJVUConverter {
       controller.cancelled = true;
       statusText.textContent = "Cancelling...";
       cancelBtn.style.opacity = "0.7";
-      this.log("User cancelled operation");
+      this.log("User cancelled current operation");
+    };
+
+    // Cancel all operations button handler
+    cancelAllBtn.onclick = () => {
+      if (!dialog.parentNode) return;
+      if (controller.finished) return;
+
+      // Cancel current
+      controller.cancelled = true;
+
+      // Clear queue
+      const cleared = this.cancelAllOperations();
+
+      statusText.textContent = cleared > 0 ? `Cancelling... (cleared ${cleared} queued)` : "Cancelling...";
+      cancelBtn.style.opacity = "0.7";
+      cancelAllBtn.style.display = "none";
+      queueInfo.style.display = "none";
+      this.log("User cancelled all operations");
     };
 
     return controller;
@@ -2734,18 +3121,15 @@ class ZoteroDJVUConverter {
   }
 
   // Convert a single DJVU file (used by batch conversion)
-  async convertSingleDjvu(item, filePath, options, progress, fileNum, totalFiles) {
+  async convertSingleDjvu(item, filePath, options, progress, fileNum, getBatchPrefix) {
     const filename = this.getBasename(filePath);
-    this.log(`Converting file ${fileNum}/${totalFiles}: ${filename}`);
-
-    // Batch prefix for progress text
-    const batchPrefix = `[${fileNum}/${totalFiles}] `;
+    this.log(`Converting file ${fileNum}: ${filename}`);
 
     // Step 1: Convert DJVU to PDF
     const tempPdfPath = filePath.replace(/\.(djvu|djv)$/i, ".pdf");
     this.log(`Converting: ${filePath} -> ${tempPdfPath}`);
 
-    await this.runDdjvuWithProgress(filePath, tempPdfPath, progress, batchPrefix);
+    await this.runDdjvuWithProgress(filePath, tempPdfPath, progress, getBatchPrefix);
 
     // Check if output file exists
     let outputExists = false;
@@ -2784,7 +3168,7 @@ class ZoteroDJVUConverter {
           pageCount,
           optimizeLevel,
           !needsOcr,
-          batchPrefix
+          getBatchPrefix
         );
 
         if (ocrSuccess && Zotero.File.pathToFile(ocrPdfPath).exists()) {
@@ -2818,7 +3202,7 @@ class ZoteroDJVUConverter {
     } catch (e) {
       // Save to temp if item was deleted
       const tempDir = Zotero.getTempDirectory().path;
-      const tempDest = PathUtils.join(tempDir, "converted_" + Date.now() + ".pdf");
+      const tempDest = PathUtils.join(tempDir, "djvu_conv_converted_" + Date.now() + ".pdf");
       await IOUtils.move(tempPdfPath, tempDest);
       throw new Error(`Item deleted. PDF saved to: ${tempDest}`);
     }
@@ -2863,307 +3247,6 @@ class ZoteroDJVUConverter {
     }
 
     return filePath;
-  }
-
-  async processAttachment(item, silentMode = false) {
-    // Prevent concurrent conversions
-    if (this._isProcessing) {
-      // In silent mode (called from notifier), just skip without showing error
-      if (silentMode) {
-        this.log("Skipping: another conversion is already in progress (silent mode)");
-        return;
-      }
-      Services.prompt.alert(
-        null,
-        "DJVU to PDF Converter",
-        "Another conversion is already in progress.\n\nPlease wait for it to complete."
-      );
-      return;
-    }
-
-    // Validate the attachment
-    const filePath = await this.validateDjvuAttachment(item);
-    if (!filePath) return;
-
-    this.log(`Attachment file path: ${filePath}`);
-    const filename = item.getField("title") || this.getBasename(filePath) || "file.djvu";
-    this.log(`DJVU file detected: ${filename}`);
-
-    // Check if ddjvu is available
-    if (!this.ddjvuFound) {
-      Services.prompt.alert(
-        null,
-        "DJVU to PDF Converter - Error",
-        "Cannot convert: ddjvu (djvulibre) is not installed.\n\n" +
-        "Please install it with:\n" +
-        this.getInstallInstructions("djvulibre") + "\n\n" +
-        "Then restart Zotero."
-      );
-      return;
-    }
-
-    // Show options dialog
-    const options = await this.showOptionsDialog(filename);
-
-    if (!options) {
-      this.log("User cancelled conversion");
-      return;
-    }
-
-    // Warn if OCR requested but dependencies not available
-    if (options.addOcr && (!this.ocrmypdfFound || !this.tesseractFound)) {
-      let missingDeps = [];
-      if (!this.ocrmypdfFound) missingDeps.push("ocrmypdf");
-      if (!this.tesseractFound) missingDeps.push("tesseract");
-
-      const continueWithoutOcr = Services.prompt.confirm(
-        null,
-        "DJVU to PDF Converter - Warning",
-        `OCR dependencies missing: ${missingDeps.join(", ")}\n\n` +
-        "To enable OCR, install with:\n" +
-        this.getInstallInstructions(["ocrmypdf", "tesseract", "tesseract-lang"]) + "\n\n" +
-        "Continue conversion without OCR?"
-      );
-      if (!continueWithoutOcr) {
-        return;
-      }
-      options.addOcr = false;
-    }
-
-    this.log(`Options: OCR=${options.addOcr}, compressLevel=${options.compressLevel}, deleteOriginal=${options.deleteOriginal}`);
-
-    // Mark as processing and ensure cleanup with try/finally
-    this._isProcessing = true;
-    let progress = null;
-
-    // Track sizes at each stage
-    const sizes = {
-      original: this.getFileSize(filePath),
-      afterConversion: 0,
-      afterOcr: 0,
-      afterCompression: 0,
-      final: 0
-    };
-
-    try {
-      // Show progress window
-      progress = this.showProgress("Starting conversion...");
-
-      // Step 1: Convert DJVU to PDF
-      const tempPdfPath = filePath.replace(/\.(djvu|djv)$/i, ".pdf");
-
-      this.log(`Converting: ${filePath} -> ${tempPdfPath}`);
-
-      // Run DJVU conversion with progress
-      await this.runDdjvuWithProgress(filePath, tempPdfPath, progress);
-
-      // Check if output file exists
-      let outputExists = false;
-      try {
-        outputExists = Zotero.File.pathToFile(tempPdfPath).exists();
-      } catch (e) {
-        this.log(`Error checking output file: ${e.message}`);
-      }
-
-      if (!outputExists) {
-        throw new Error(
-          "DJVU to PDF conversion failed.\n\n" +
-          "The output file was not created. Possible causes:\n" +
-          "- Corrupted DJVU file\n" +
-          "- Insufficient disk space\n" +
-          "- Permission issues"
-        );
-      }
-
-      sizes.afterConversion = this.getFileSize(tempPdfPath);
-      this.log(`Size after conversion: ${this.formatSize(sizes.afterConversion)}`);
-
-      // Check if cancelled after conversion
-      if (progress.cancelled) {
-        this.log("Conversion cancelled after DJVU to PDF step");
-        try { await IOUtils.remove(tempPdfPath); } catch (e) {}
-        progress.close();
-        return;
-      }
-
-      let finalPdfPath = tempPdfPath;
-
-      // Step 2: Run ocrmypdf for OCR and/or compression
-      // ocrmypdf handles both OCR (via tesseract) and optimization (via -O level)
-      const needsOcr = options.addOcr;
-      const needsCompression = options.compressLevel && options.compressLevel !== "none";
-      const optimizeLevel = ZoteroDJVUConverter.getOptimizeLevel(options.compressLevel);
-
-      if ((needsOcr || needsCompression) && this.ocrmypdfFound) {
-        sizes.afterOcr = sizes.afterConversion; // Default in case processing fails
-
-        const ocrPdfPath = tempPdfPath.replace(/\.pdf$/i, "_ocr.pdf");
-
-        // Get page count for progress display
-        const pageCount = await this.getPdfPageCount(tempPdfPath);
-        this.log(`PDF has ${pageCount || "unknown"} pages`);
-
-        // Determine what we're doing for logging/progress
-        let stepDescription;
-        if (needsOcr && needsCompression) {
-          stepDescription = "Running OCR + compression";
-        } else if (needsOcr) {
-          stepDescription = "Running OCR";
-        } else {
-          stepDescription = "Compressing PDF";
-        }
-
-        this.log(`${stepDescription}: ${tempPdfPath} -> ${ocrPdfPath} (optimize level: ${optimizeLevel})`);
-
-        try {
-          // Run ocrmypdf with progress updates
-          // When OCR is disabled, use forceOcr=false and --skip-text mode (handled in runOcrWithProgress)
-          // The skipOcr parameter tells runOcrWithProgress to use --skip-text even when not adding OCR
-          const ocrSuccess = await this.runOcrWithProgress(
-            tempPdfPath,
-            ocrPdfPath,
-            progress,
-            false,  // forceOcr - don't redo existing OCR
-            options.ocrLanguages || "eng",
-            pageCount,
-            optimizeLevel,
-            !needsOcr  // skipOcr - if we don't need OCR, skip it but still optimize
-          );
-
-          if (ocrSuccess && Zotero.File.pathToFile(ocrPdfPath).exists()) {
-            // Delete the original and use processed version
-            await IOUtils.remove(tempPdfPath);
-            await IOUtils.move(ocrPdfPath, tempPdfPath);
-            sizes.afterOcr = this.getFileSize(tempPdfPath);
-            this.log(`Processing completed successfully. Size after: ${this.formatSize(sizes.afterOcr)}`);
-          } else {
-            sizes.afterOcr = sizes.afterConversion;
-            this.log("Processing output not found, using original version");
-          }
-        } catch (ocrError) {
-          this.log(`Processing failed: ${ocrError.message}`);
-
-          // Check if cancelled
-          if (ocrError.message.includes("Cancelled by user") || progress.cancelled) {
-            this.log("Processing was cancelled by user");
-            try { await IOUtils.remove(tempPdfPath); } catch (e) {}
-            try { await IOUtils.remove(ocrPdfPath); } catch (e) {}
-            progress.close();
-            return;
-          }
-
-          // Show error but continue with original PDF
-          let errorMsg;
-          if (ocrError.message.includes("timeout")) {
-            errorMsg = "Processing timed out (file too large)";
-          } else {
-            // Truncate long messages
-            errorMsg = ocrError.message.substring(0, 100);
-          }
-          progress.updateText("Processing failed - using original PDF");
-
-          // Log full error for debugging
-          this.log(`Full processing error: ${ocrError.message}`);
-
-          // Show simple alert
-          const alertTitle = needsOcr ? "OCR Failed" : "Compression Failed";
-          Services.prompt.alert(
-            null,
-            alertTitle,
-            `PDF processing failed.\n\nReason: ${errorMsg}\n\nPDF will be saved without processing.`
-          );
-        }
-      } else {
-        // No processing needed
-        sizes.afterOcr = sizes.afterConversion;
-      }
-
-      // Final cancellation check before updating library
-      if (progress.cancelled) {
-        this.log("Conversion cancelled before library update");
-        try { await IOUtils.remove(finalPdfPath); } catch (e) {}
-        progress.close();
-        return;
-      }
-
-      // Get final size BEFORE moving file
-      sizes.final = this.getFileSize(finalPdfPath);
-
-      progress.setProgress(90);
-      progress.updateText("Updating Zotero library...");
-
-      // Step 4: Handle the converted file
-      // Check if item still exists and is not in trash
-      try {
-        const itemStillExists = await Zotero.Items.getAsync(item.id);
-        if (!itemStillExists) {
-          throw new Error("Item was deleted during conversion");
-        }
-        if (itemStillExists.deleted) {
-          throw new Error("Item was moved to trash during conversion");
-        }
-      } catch (e) {
-        this.log(`Item check failed: ${e.message}`);
-        // Item might have been deleted or trashed, save PDF to temp location and notify user
-        const tempDir = Zotero.getTempDirectory().path;
-        const tempDest = PathUtils.join(tempDir, "converted_" + Date.now() + ".pdf");
-        await IOUtils.move(finalPdfPath, tempDest);
-        throw new Error(`Original item was deleted or moved to trash during conversion.\n\nThe converted PDF was saved to:\n${tempDest}`);
-      }
-
-      if (options.deleteOriginal) {
-        await this.replaceAttachment(item, finalPdfPath);
-        this.log("Replaced DJVU with PDF");
-      } else {
-        await this.addPDFSibling(item, finalPdfPath);
-        this.log("Added PDF as sibling attachment");
-      }
-
-      // Build size info string
-      let sizeInfo = `DJVU: ${this.formatSize(sizes.original)}`;
-      sizeInfo += ` → PDF: ${this.formatSize(sizes.afterConversion)}`;
-
-      // Show processing result (OCR and/or compression via ocrmypdf)
-      if ((needsOcr || needsCompression) && sizes.afterOcr !== sizes.afterConversion) {
-        let processLabel;
-        if (needsOcr && needsCompression) {
-          processLabel = "OCR+Comp";
-        } else if (needsOcr) {
-          processLabel = "OCR";
-        } else {
-          processLabel = "Compressed";
-        }
-        sizeInfo += ` → ${processLabel}: ${this.formatSize(sizes.afterOcr)}`;
-      }
-
-      progress.finish(true, "Done! " + sizeInfo);
-      this.log(`Conversion completed: ${sizeInfo}`);
-
-    } catch (e) {
-      this.log(`Conversion failed: ${e.message}\n${e.stack}`);
-
-      // Clean up any temp files
-      const tempPdfPath = filePath.replace(/\.(djvu|djv)$/i, ".pdf");
-      await this.cleanupTempFiles(tempPdfPath);
-
-      // If cancelled, just close silently
-      if ((progress && progress.cancelled) || e.message.includes("Cancelled")) {
-        if (progress) progress.close();
-        return;
-      }
-
-      // Show detailed error in progress window
-      if (progress) progress.finish(false, "Conversion failed");
-
-      // Show detailed error dialog
-      Services.prompt.alert(
-        null,
-        "DJVU to PDF Converter - Error",
-        `Conversion failed:\n\n${e.message}`
-      );
-    } finally {
-      this._isProcessing = false;
-    }
   }
 
   async replaceAttachment(item, pdfPath) {
@@ -3309,7 +3392,7 @@ class ZoteroDJVUConverter {
     }
   }
 
-  async runOcrWithProgress(inputPath, outputPath, progress, forceOcr = false, languages = "eng", pageCount = null, optimizeLevel = 1, skipOcr = false, batchPrefix = "") {
+  async runOcrWithProgress(inputPath, outputPath, progress, forceOcr = false, languages = "eng", pageCount = null, optimizeLevel = 1, skipOcr = false, getBatchPrefix = () => "") {
     const modeDesc = skipOcr ? "compression-only" : (forceOcr ? "force-OCR" : "OCR");
     this.log(`Starting ${modeDesc} process...`);
     this.log(`Languages: ${languages}, pages: ${pageCount || "unknown"}, optimize: -O ${optimizeLevel}, skipOcr: ${skipOcr}`);
@@ -3362,7 +3445,7 @@ class ZoteroDJVUConverter {
 
         // Parse progress from log file using helper
         const { statusText, pageInfo } = await this.parseOcrProgress(errorLogFile, pageCount, skipOcr);
-        progress.updateText(`${batchPrefix}${statusText}${pageInfo} • ${elapsedSec}s`);
+        progress.updateText(`${getBatchPrefix()}${statusText}${pageInfo} • ${elapsedSec}s`);
 
         // Check if done
         let done = false;
@@ -3436,7 +3519,7 @@ class ZoteroDJVUConverter {
 
       this.log(`Using djvused at: ${djvusedPath}`);
 
-      const tempFile = PathUtils.join(Zotero.getTempDirectory().path, `djvu_pagecount_${Date.now()}.txt`);
+      const tempFile = PathUtils.join(Zotero.getTempDirectory().path, `djvu_conv_pagecount_${Date.now()}.txt`);
 
       let cmd;
       if (this.isWindows()) {
@@ -3476,7 +3559,7 @@ class ZoteroDJVUConverter {
     }
   }
 
-  async runDdjvuWithProgress(inputPath, outputPath, progress, batchPrefix = "") {
+  async runDdjvuWithProgress(inputPath, outputPath, progress, getBatchPrefix = () => "") {
     if (!inputPath || !outputPath) {
       throw new Error("Missing input or output path");
     }
@@ -3556,7 +3639,7 @@ class ZoteroDJVUConverter {
           // Log file might not exist yet
         }
 
-        progress.updateText(`${batchPrefix}Converting DJVU to PDF${pageInfo} • ${elapsedSec}s`);
+        progress.updateText(`${getBatchPrefix()}Converting DJVU to PDF${pageInfo} • ${elapsedSec}s`);
 
         let done = false;
         let error = false;
