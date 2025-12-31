@@ -229,12 +229,13 @@ class ZoteroDJVUConverter {
   }
 
   // Build PATH export string for shell commands (Unix only)
+  // Also sets LANG for UTF-8 support (needed for non-ASCII filenames like Cyrillic)
   getPathExport() {
     const os = Services.appinfo.OS;
     if (os === "WINNT") return ""; // Windows doesn't use this
 
     const paths = this.getSearchPaths();
-    return `export PATH="${paths.join(":")}:$PATH";`;
+    return `export LANG=en_US.UTF-8; export PATH="${paths.join(":")}:$PATH";`;
   }
 
   // Check if running on Windows
@@ -528,8 +529,9 @@ class ZoteroDJVUConverter {
         const cmd = `"${escapedToolWin}" "${escapedPdfWin}" 2>nul | findstr /i "^Pages:" > "${escapedTempWin}"`;
         await Zotero.Utilities.Internal.exec("cmd.exe", ["/c", cmd]);
       } else {
+        // Set LANG for UTF-8 support (needed for non-ASCII filenames like Cyrillic)
         await Zotero.Utilities.Internal.exec("/bin/sh", ["-c",
-          `"${this.pdfinfoPath}" "${escapedPdf}" 2>/dev/null | grep -i "^Pages:" > "${escapedTemp}"`
+          `export LANG=en_US.UTF-8; "${this.pdfinfoPath}" "${escapedPdf}" 2>/dev/null | grep -i "^Pages:" > "${escapedTemp}"`
         ]);
       }
 
@@ -1028,7 +1030,8 @@ class ZoteroDJVUConverter {
         const cmd = `"${escapedToolWin}" -f 1 -l 3 "${escapedPdfWin}" "${escapedTxtWin}" 2>nul`;
         await Zotero.Utilities.Internal.exec("cmd.exe", ["/c", cmd]);
       } else {
-        const cmd = `"${this.pdftotextPath}" -f 1 -l 3 "${escapedPdf}" "${escapedTxt}" 2>/dev/null`;
+        // Set LANG for UTF-8 support (needed for non-ASCII filenames like Cyrillic)
+        const cmd = `export LANG=en_US.UTF-8; "${this.pdftotextPath}" -f 1 -l 3 "${escapedPdf}" "${escapedTxt}" 2>/dev/null`;
         await Zotero.Utilities.Internal.exec("/bin/sh", ["-c", cmd]);
       }
 
@@ -2454,7 +2457,8 @@ class ZoteroDJVUConverter {
         } else {
           const escapedInput = self.escapeShellPath(inputPath);
           const escapedTemp = self.escapeShellPath(tempFile);
-          cmd = `"${djvusedPath}" "${escapedInput}" -e 'n' > "${escapedTemp}" 2>&1`;
+          // Set LANG for UTF-8 support (needed for non-ASCII filenames like Cyrillic)
+          cmd = `export LANG=en_US.UTF-8; "${djvusedPath}" "${escapedInput}" -e 'n' > "${escapedTemp}" 2>&1`;
         }
 
         const process = Components.classes["@mozilla.org/process/util;1"]
@@ -2522,7 +2526,8 @@ class ZoteroDJVUConverter {
       const escapedInput = this.escapeShellPath(inputPath);
       const escapedOutput = this.escapeShellPath(outputPath);
       const escapedLog = this.escapeShellPath(logFile);
-      ddjvuCmd = `"${this.ddjvuPath}" -format=pdf -verbose "${escapedInput}" "${escapedOutput}" 2>"${escapedLog}"`;
+      // Set LANG for UTF-8 support (needed for non-ASCII filenames like Cyrillic)
+      ddjvuCmd = `export LANG=en_US.UTF-8; "${this.ddjvuPath}" -format=pdf -verbose "${escapedInput}" "${escapedOutput}" 2>"${escapedLog}"`;
     }
 
     // Start background process using helper
@@ -2580,6 +2585,13 @@ class ZoteroDJVUConverter {
           resolve(true);
         } else if (error) {
           clearInterval(checkInterval);
+          // Log file contents for debugging before cleanup
+          try {
+            const logContent = await Zotero.File.getContentsAsync(logFile);
+            this.log(`DJVU log file content (last 500 chars): ${logContent ? logContent.slice(-500) : 'empty'}`);
+          } catch (e) {
+            this.log(`Could not read log file: ${e.message}`);
+          }
           try { await IOUtils.remove(errorFile); } catch (e) {}
           try { await IOUtils.remove(logFile); } catch (e) {}
           try { await IOUtils.remove(pidFile); } catch (e) {}

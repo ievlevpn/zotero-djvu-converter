@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "DJVU to PDF Converter",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Automatically prompts to convert DJVU attachments to PDF when added to Zotero",
   "author": "ievlevpn",
   "homepage_url": "https://github.com/ievlevpn/zotero-djvu-converter",
