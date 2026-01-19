@@ -821,11 +821,23 @@ class ZoteroDJVUConverter {
     } else if (os === "WINNT") {
       // Windows: Common paths (requires tools installed via Chocolatey, Scoop, etc.)
       paths.push("C:\\Program Files\\DjVuLibre");
+      paths.push("C:\\Program Files (x86)\\DjVuLibre");
       paths.push("C:\\Program Files\\Tesseract-OCR");
+      paths.push("C:\\ProgramData\\chocolatey\\bin"); // Chocolatey shims
+      // Python Scripts directories (for pip-installed packages like ocrmypdf)
+      for (const ver of ["39", "310", "311", "312", "313"]) {
+        paths.push(`C:\\Python${ver}\\Scripts`);
+        paths.push(`C:\\Program Files\\Python${ver}\\Scripts`);
+      }
       try {
         const home = Services.dirsvc.get("Home", Ci.nsIFile).path;
         paths.push(PathUtils.join(home, "scoop", "shims")); // Scoop
         paths.push(PathUtils.join(home, "AppData", "Local", "Programs")); // User installs
+        // User-installed Python Scripts
+        for (const ver of ["39", "310", "311", "312", "313"]) {
+          paths.push(PathUtils.join(home, "AppData", "Local", "Programs", "Python", `Python${ver}`, "Scripts"));
+          paths.push(PathUtils.join(home, "AppData", "Roaming", "Python", `Python${ver}`, "Scripts"));
+        }
       } catch (e) {}
     }
 
@@ -874,7 +886,7 @@ class ZoteroDJVUConverter {
       return pkgList.map(p => `  sudo apt install ${aptMap[p] || p}`).join("\n");
     } else if (os === "WINNT") {
       const winMap = {
-        "djvulibre": "choco install djvulibre",
+        "djvulibre": "choco install djvu-libre",
         "ocrmypdf": "pip install ocrmypdf",
         "tesseract": "choco install tesseract",
         "tesseract-lang": "" // included with tesseract on Windows
@@ -1332,7 +1344,7 @@ class ZoteroDJVUConverter {
       // Windows instructions
       message += "Using Chocolatey:\n";
       if (!this.ddjvuFound) {
-        message += "  choco install djvulibre\n";
+        message += "  choco install djvu-libre\n";
       }
       if (!this.ocrmypdfFound) {
         message += "  pip install ocrmypdf\n";

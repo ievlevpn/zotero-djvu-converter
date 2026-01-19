@@ -62,7 +62,7 @@ Using [Chocolatey](https://chocolatey.org/):
 
 ```powershell
 # Required for DJVU conversion
-choco install djvulibre
+choco install djvu-libre
 
 # Required for OCR and PDF compression
 choco install tesseract
@@ -145,7 +145,7 @@ zotero-djvu-converter/
 Install djvulibre:
 - **macOS**: `brew install djvulibre`
 - **Linux**: `sudo apt install djvulibre-bin`
-- **Windows**: `choco install djvulibre`
+- **Windows**: `choco install djvu-libre`
 
 ### "ocrmypdf not found" error
 Install OCR dependencies:
