@@ -14,6 +14,8 @@ A Zotero 7/8 plugin that converts DJVU files to PDF with optional OCR and compre
 - **OCR Support**: Add searchable text layer to PDFs (supports 12 languages)
 - **PDF Compression**: Reduce file size using ocrmypdf optimization
 - **Cover Removal**: Optionally drop the first page (cover) — scanned covers often account for much of the file size
+- **Bookmarks Carried Over**: The DJVU table of contents becomes PDF bookmarks in the converted file
+- **PDF Metadata**: Converted PDFs get title and author from the Zotero item
 - **Flexible Options**: Choose to replace original or keep both files
 - **Progress Tracking**: Visual progress with cancel button
 - **Size Reporting**: Shows file size at each conversion stage
@@ -176,6 +178,10 @@ Make sure the required language pack is installed:
 - **Windows**: Download language packs from [Tesseract GitHub](https://github.com/tesseract-ocr/tessdata)
 
 ## Changelog
+
+### v1.8.0
+- **Table of Contents Preserved**: The DJVU navigation outline (chapters/sections, any language) is carried over as PDF bookmarks during conversion — `ddjvu` normally drops it. Bookmark targets are adjusted when the cover page is removed
+- **PDF Metadata from Zotero**: Converted PDFs get Title and Author from the attachment's parent item, so files carry proper metadata outside Zotero
 
 ### v1.7.0
 - **Cover Removal**: New "Remove cover (first page)" option in conversion and compression dialogs — covers are often heavy scanned images

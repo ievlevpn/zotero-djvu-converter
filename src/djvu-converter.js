@@ -1351,11 +1351,13 @@ class ZoteroDJVUConverter {
     }
   }
 
-  // Downsample images in a PDF in place using Ghostscript (lossy, opt-in)
-  // Only replaces the file if the result is smaller. Returns true if replaced.
-  async downsamplePdfImages(pdfPath, progress, getBatchPrefix = () => "") {
+  // Rewrite a PDF in place via a Ghostscript pdfwrite pass
+  // opts: { flags, trailingFile, statusText, shouldReplace(inputSize, outputSize) }
+  // Replaces the original only if shouldReplace returns true. Returns true if replaced.
+  async runGsRewrite(pdfPath, opts, progress, getBatchPrefix = () => "") {
+    const statusText = opts.statusText || "Processing PDF";
     if (!this.gsPath) {
-      this.log("Cannot downsample: ghostscript not found");
+      this.log(`${statusText}: ghostscript not found, skipping`);
       return false;
     }
 
@@ -1363,7 +1365,7 @@ class ZoteroDJVUConverter {
 
     // Use temp paths with safe ASCII names to avoid shell escaping issues
     const tempDir = Zotero.getTempDirectory().path;
-    const tempId = `djvu_conv_downsample_${Date.now()}`;
+    const tempId = `djvu_conv_gs_${Date.now()}`;
     const tempInput = PathUtils.join(tempDir, `${tempId}_in.pdf`);
     const tempOutput = PathUtils.join(tempDir, `${tempId}_out.pdf`);
     const markerFile = PathUtils.join(tempDir, `${tempId}.done`);
@@ -1373,20 +1375,13 @@ class ZoteroDJVUConverter {
     try {
       await IOUtils.copy(pdfPath, tempInput);
     } catch (e) {
-      this.log(`Downsample: failed to copy input: ${e.message}`);
+      this.log(`${statusText}: failed to copy input: ${e.message}`);
       return false;
     }
 
-    const colorDpi = ZoteroDJVUConverter.DOWNSAMPLE_COLOR_DPI;
-    const monoDpi = ZoteroDJVUConverter.DOWNSAMPLE_MONO_DPI;
-    // /ebook preset provides sane image re-encoding settings; explicit flags
-    // after it override its resolutions. Threshold 1.0 downsamples any image
-    // above the target resolution.
-    const gsCmd = `"${this.gsPath}" -q -dNOPAUSE -dBATCH -sDEVICE=pdfwrite -dPDFSETTINGS=/ebook ` +
-      `-dColorImageResolution=${colorDpi} -dColorImageDownsampleThreshold=1.0 ` +
-      `-dGrayImageResolution=${colorDpi} -dGrayImageDownsampleThreshold=1.0 ` +
-      `-dMonoImageResolution=${monoDpi} -dMonoImageDownsampleThreshold=1.0 ` +
-      `-sOutputFile="${tempOutput}" "${tempInput}"`;
+    const trailing = opts.trailingFile ? ` "${opts.trailingFile}"` : "";
+    const gsCmd = `"${this.gsPath}" -q -dNOPAUSE -dBATCH -sDEVICE=pdfwrite ${opts.flags || ""} ` +
+      `-sOutputFile="${tempOutput}" "${tempInput}"${trailing}`;
 
     // Process pattern for kill on Windows (gswin64c) vs Unix (gs)
     const gsPattern = this.getBasename(this.gsPath).replace(/\.(exe|bat|cmd)$/i, "");
@@ -1410,13 +1405,13 @@ class ZoteroDJVUConverter {
             await this.killBackgroundProcess(pidFile, gsPattern);
             this._activeProcesses.delete(pidFile);
             await cleanup();
-            this.log("Downsampling cancelled");
+            this.log(`${statusText}: cancelled`);
             resolve(false);
             return;
           }
 
           const elapsedSec = Math.floor((Date.now() - startTime) / 1000);
-          progress.updateText(`${getBatchPrefix()}Downsampling images • ${elapsedSec}s`);
+          progress.updateText(`${getBatchPrefix()}${statusText} • ${elapsedSec}s`);
 
           let done = false;
           let error = false;
@@ -1428,16 +1423,16 @@ class ZoteroDJVUConverter {
             this._activeProcesses.delete(pidFile);
             const outputSize = this.getFileSize(tempOutput);
             let replaced = false;
-            if (outputSize > 0 && outputSize < inputSize) {
+            if (outputSize > 0 && opts.shouldReplace(inputSize, outputSize)) {
               try {
                 await IOUtils.copy(tempOutput, pdfPath);
-                this.log(`Downsampled: ${this.formatSize(inputSize)} -> ${this.formatSize(outputSize)}`);
+                this.log(`${statusText}: ${this.formatSize(inputSize)} -> ${this.formatSize(outputSize)}`);
                 replaced = true;
               } catch (e) {
-                this.log(`Downsample: failed to replace original: ${e.message}`);
+                this.log(`${statusText}: failed to replace original: ${e.message}`);
               }
             } else {
-              this.log(`Downsampling did not reduce size (${this.formatSize(outputSize)}), keeping original`);
+              this.log(`${statusText}: keeping original (output was ${this.formatSize(outputSize)})`);
             }
             await cleanup();
             resolve(replaced);
@@ -1445,24 +1440,44 @@ class ZoteroDJVUConverter {
             clearInterval(checkInterval);
             this._activeProcesses.delete(pidFile);
             await cleanup();
-            this.log("Downsampling failed, keeping original");
+            this.log(`${statusText}: failed, keeping original`);
             resolve(false);
           } else if (Date.now() - startTime >= ZoteroDJVUConverter.TIMEOUT_DOWNSAMPLE) {
             clearInterval(checkInterval);
             await this.killBackgroundProcess(pidFile, gsPattern);
             this._activeProcesses.delete(pidFile);
             await cleanup();
-            this.log("Downsampling timed out, keeping original");
+            this.log(`${statusText}: timed out, keeping original`);
             resolve(false);
           }
         } catch (e) {
           clearInterval(checkInterval);
-          this.log(`Error in downsample polling: ${e.message}`);
+          this.log(`${statusText}: polling error: ${e.message}`);
           await cleanup();
           resolve(false);
         }
       }, ZoteroDJVUConverter.POLL_INTERVAL_FAST);
     });
+  }
+
+  // Downsample images in a PDF in place using Ghostscript (lossy, opt-in)
+  // Only replaces the file if the result is smaller. Returns true if replaced.
+  async downsamplePdfImages(pdfPath, progress, getBatchPrefix = () => "") {
+    const colorDpi = ZoteroDJVUConverter.DOWNSAMPLE_COLOR_DPI;
+    const monoDpi = ZoteroDJVUConverter.DOWNSAMPLE_MONO_DPI;
+    // /ebook preset provides sane image re-encoding settings; explicit flags
+    // after it override its resolutions. Threshold 1.0 downsamples any image
+    // above the target resolution.
+    const flags = `-dPDFSETTINGS=/ebook ` +
+      `-dColorImageResolution=${colorDpi} -dColorImageDownsampleThreshold=1.0 ` +
+      `-dGrayImageResolution=${colorDpi} -dGrayImageDownsampleThreshold=1.0 ` +
+      `-dMonoImageResolution=${monoDpi} -dMonoImageDownsampleThreshold=1.0`;
+
+    return this.runGsRewrite(pdfPath, {
+      flags,
+      statusText: "Downsampling images",
+      shouldReplace: (inputSize, outputSize) => outputSize < inputSize
+    }, progress, getBatchPrefix);
   }
 
   // Find executable on PATH using `which` (Unix) or `where` (Windows)
@@ -3627,7 +3642,7 @@ class ZoteroDJVUConverter {
     const tempPdfPath = filePath.replace(/\.(djvu|djv)$/i, ".pdf");
     this.log(`Converting: ${filePath} -> ${tempPdfPath}`);
 
-    await this.runDdjvuWithProgress(filePath, tempPdfPath, progress, getBatchPrefix, options.removeCover);
+    const ddjvuResult = await this.runDdjvuWithProgress(filePath, tempPdfPath, progress, getBatchPrefix, options.removeCover);
 
     // Get converted PDF size
     let convertedSize = 0;
@@ -3658,6 +3673,27 @@ class ZoteroDJVUConverter {
     // Done before OCR/compression so jbig2/pngquant optimization survives in the final file
     if (options.downsample && !progress.cancelled) {
       await this.downsamplePdfImages(tempPdfPath, progress, getBatchPrefix);
+    }
+
+    // Step 1.6: Carry over the DJVU outline as PDF bookmarks and set
+    // title/author from the Zotero item (ocrmypdf preserves both downstream)
+    if (this.gsPath && !progress.cancelled) {
+      let outline = ddjvuResult.outline || [];
+      if (ddjvuResult.coverRemoved && outline.length > 0) {
+        // Page 1 was dropped - shift all bookmark targets
+        const shift = (nodes) => nodes.forEach(n => {
+          n.page = Math.max(1, n.page - 1);
+          shift(n.children);
+        });
+        shift(outline);
+      }
+      const maxPage = ddjvuResult.pageCount
+        ? (ddjvuResult.coverRemoved ? ddjvuResult.pageCount - 1 : ddjvuResult.pageCount)
+        : null;
+      const marks = this.buildPdfmarks(outline, this.getItemMetadata(item), maxPage);
+      if (marks) {
+        await this.applyPdfmarksToPdf(tempPdfPath, marks, progress, getBatchPrefix);
+      }
     }
 
     // Step 2: Run ocrmypdf for OCR and/or compression
@@ -4082,27 +4118,34 @@ class ZoteroDJVUConverter {
     });
   }
 
-  async getDjvuPageCount(inputPath) {
-    try {
-      // Find djvused - try same directory as ddjvu first, then search PATH
-      let djvusedPath = this.ddjvuPath.replace(/ddjvu([^\/\\]*)$/, "djvused$1");
+  // Find djvused (ships with djvulibre alongside ddjvu), cached
+  async getDjvusedPath() {
+    if (this._djvusedPath !== undefined) return this._djvusedPath;
 
-      // Check if djvused exists at the guessed path
-      let djvusedExists = false;
+    // Try same directory as ddjvu first, then search PATH
+    let djvusedPath = this.ddjvuPath ? this.ddjvuPath.replace(/ddjvu([^\/\\]*)$/, "djvused$1") : null;
+    let djvusedExists = false;
+    if (djvusedPath) {
       try {
         djvusedExists = Zotero.File.pathToFile(djvusedPath).exists();
       } catch (e) {}
+    }
+    if (!djvusedExists) {
+      djvusedPath = await this.findExecutable("djvused");
+    }
 
-      if (!djvusedExists) {
-        // Try to find djvused on PATH
-        djvusedPath = await this.findExecutable("djvused");
-        if (!djvusedPath) {
-          this.log("djvused not found, cannot get DJVU page count");
-          return null;
-        }
+    this._djvusedPath = djvusedPath || null;
+    if (this._djvusedPath) this.log(`Using djvused at: ${this._djvusedPath}`);
+    return this._djvusedPath;
+  }
+
+  async getDjvuPageCount(inputPath) {
+    try {
+      const djvusedPath = await this.getDjvusedPath();
+      if (!djvusedPath) {
+        this.log("djvused not found, cannot get DJVU page count");
+        return null;
       }
-
-      this.log(`Using djvused at: ${djvusedPath}`);
 
       const tempFile = PathUtils.join(Zotero.getTempDirectory().path, `djvu_conv_pagecount_${Date.now()}.txt`);
 
@@ -4142,6 +4185,218 @@ class ZoteroDJVUConverter {
     }
   }
 
+  // Extract the document outline (table of contents) from a DJVU file
+  // Returns a tree of {title, page, children} with 1-based pages, or []
+  async getDjvuOutline(djvuPath) {
+    try {
+      const djvusedPath = await this.getDjvusedPath();
+      if (!djvusedPath) return [];
+
+      const tempFile = PathUtils.join(Zotero.getTempDirectory().path, `djvu_conv_outline_${Date.now()}.txt`);
+
+      // `ls` provides the page-id -> page-number map for named outline refs
+      if (this.isWindows()) {
+        const escapedTool = this.escapeWindowsPath(djvusedPath);
+        const escapedInput = this.escapeWindowsPath(djvuPath);
+        const escapedTemp = this.escapeWindowsPath(tempFile);
+        const cmd = `"${escapedTool}" "${escapedInput}" -e "ls; print-outline" > "${escapedTemp}" 2>nul`;
+        await Zotero.Utilities.Internal.exec("cmd.exe", ["/c", cmd]);
+      } else {
+        // djvuPath is a safe ASCII temp path
+        await Zotero.Utilities.Internal.exec("/bin/sh", ["-c",
+          `export LANG=en_US.UTF-8; "${djvusedPath}" "${djvuPath}" -e 'ls; print-outline' > "${tempFile}" 2>/dev/null`
+        ]);
+      }
+
+      await Zotero.Promise.delay(100);
+
+      let content = "";
+      try {
+        content = await Zotero.File.getContentsAsync(tempFile);
+      } catch (e) {}
+      try { await IOUtils.remove(tempFile); } catch (e) {}
+      if (!content) return [];
+
+      const outlineStart = content.indexOf("(bookmarks");
+      if (outlineStart < 0) return [];
+
+      const pageIndexByName = {};
+      for (const line of content.slice(0, outlineStart).split(/\r?\n/)) {
+        const m = line.match(/^\s*(\d+)\s+P\s+\d+\s+(.+?)\s*$/);
+        if (m) pageIndexByName[m[2]] = parseInt(m[1], 10);
+      }
+
+      const outline = this.parseDjvuOutline(content.slice(outlineStart), pageIndexByName);
+      this.log(`DJVU outline: ${outline.length} top-level entries`);
+      return outline;
+    } catch (e) {
+      this.log(`Failed to extract DJVU outline: ${e.message}`);
+      return [];
+    }
+  }
+
+  // Parse djvused print-outline S-expression: (bookmarks ("title" "#ref" children...) ...)
+  // Strings contain UTF-8 bytes as octal escapes. Returns [{title, page, children}]
+  parseDjvuOutline(sexpr, pageIndexByName = {}) {
+    // Tokenize into "(", ")" and decoded strings; bare atoms (bookmarks) are skipped
+    const tokens = [];
+    const encoder = new TextEncoder();
+    let i = 0;
+    while (i < sexpr.length) {
+      const c = sexpr[i];
+      if (c === "(" || c === ")") {
+        tokens.push(c);
+        i++;
+      } else if (c === '"') {
+        i++;
+        const bytes = [];
+        while (i < sexpr.length && sexpr[i] !== '"') {
+          if (sexpr[i] === "\\") {
+            const next = sexpr[i + 1];
+            if (next >= "0" && next <= "7") {
+              let oct = "";
+              let j = i + 1;
+              while (j < sexpr.length && oct.length < 3 && sexpr[j] >= "0" && sexpr[j] <= "7") {
+                oct += sexpr[j];
+                j++;
+              }
+              bytes.push(parseInt(oct, 8));
+              i = j;
+            } else {
+              const map = { n: 10, t: 9, r: 13 };
+              if (map[next]) bytes.push(map[next]);
+              else encoder.encode(next).forEach(b => bytes.push(b));
+              i += 2;
+            }
+          } else {
+            encoder.encode(sexpr[i]).forEach(b => bytes.push(b));
+            i++;
+          }
+        }
+        i++; // closing quote
+        tokens.push({ str: new TextDecoder("utf-8").decode(new Uint8Array(bytes)) });
+      } else {
+        i++;
+      }
+    }
+
+    // Recursive descent: node = ( "title" "url" node* )
+    let pos = 0;
+    const parseNode = () => {
+      pos++; // consume "("
+      const node = { title: "", page: null, children: [] };
+      if (tokens[pos] && tokens[pos].str !== undefined) {
+        node.title = tokens[pos].str;
+        pos++;
+      }
+      if (tokens[pos] && tokens[pos].str !== undefined) {
+        node.page = this.resolveDjvuPageRef(tokens[pos].str, pageIndexByName);
+        pos++;
+      }
+      while (pos < tokens.length && tokens[pos] === "(") {
+        node.children.push(parseNode());
+      }
+      if (tokens[pos] === ")") pos++;
+      return node;
+    };
+
+    const roots = [];
+    if (tokens[pos] === "(") {
+      pos++;
+      while (pos < tokens.length && tokens[pos] === "(") {
+        roots.push(parseNode());
+      }
+    }
+
+    // Drop entries without a resolvable page, inheriting from first child when possible
+    const fix = (nodes) => nodes
+      .map(n => {
+        n.children = fix(n.children);
+        if (n.page === null && n.children.length > 0) n.page = n.children[0].page;
+        return n;
+      })
+      .filter(n => n.page !== null && n.title);
+    return fix(roots);
+  }
+
+  // Resolve a DJVU outline ref ("#12" or "#page_id") to a 1-based page number
+  resolveDjvuPageRef(url, pageIndexByName) {
+    if (!url || !url.startsWith("#")) return null;
+    const ref = url.slice(1);
+    if (/^\d+$/.test(ref)) return parseInt(ref, 10);
+    return pageIndexByName[ref] || null;
+  }
+
+  // Encode a string as a UTF-16BE hex string for pdfmarks (handles any language)
+  toUtf16BeHex(str) {
+    let hex = "FEFF";
+    for (let i = 0; i < str.length; i++) {
+      hex += str.charCodeAt(i).toString(16).toUpperCase().padStart(4, "0");
+    }
+    return hex;
+  }
+
+  // Build pdfmarks content for bookmarks and document metadata
+  // Returns null if there is nothing to add
+  buildPdfmarks(outline, metadata, maxPage = null) {
+    const lines = ["/pdfmark where {pop} {userdict /pdfmark /cleartomark load put} ifelse"];
+
+    const emit = (node) => {
+      let page = node.page;
+      if (maxPage && page > maxPage) page = maxPage;
+      if (page < 1) page = 1;
+      let mark = `[/Title <${this.toUtf16BeHex(node.title)}> /Page ${page}`;
+      if (node.children.length > 0) mark += ` /Count ${node.children.length}`;
+      mark += " /OUT pdfmark";
+      lines.push(mark);
+      node.children.forEach(emit);
+    };
+    (outline || []).forEach(emit);
+
+    const info = [];
+    if (metadata && metadata.title) info.push(`/Title <${this.toUtf16BeHex(metadata.title)}>`);
+    if (metadata && metadata.author) info.push(`/Author <${this.toUtf16BeHex(metadata.author)}>`);
+    if (info.length > 0) lines.push(`[${info.join(" ")} /DOCINFO pdfmark`);
+
+    return lines.length > 1 ? lines.join("\n") + "\n" : null;
+  }
+
+  // Get title/author for PDF metadata from the attachment's parent item
+  getItemMetadata(item) {
+    try {
+      const parent = item.parentItem;
+      if (!parent) return {};
+      const title = parent.getField("title") || "";
+      let author = "";
+      try {
+        author = parent.getCreators()
+          .map(c => [c.firstName, c.lastName].filter(Boolean).join(" "))
+          .filter(Boolean)
+          .join("; ");
+      } catch (e) {}
+      return { title, author };
+    } catch (e) {
+      return {};
+    }
+  }
+
+  // Add bookmarks/metadata to a PDF in place via a pdfmarks file
+  // Accepts modest growth - the navigation/metadata justifies it
+  async applyPdfmarksToPdf(pdfPath, marksContent, progress, getBatchPrefix = () => "") {
+    const marksFile = PathUtils.join(Zotero.getTempDirectory().path, `djvu_conv_marks_${Date.now()}.ps`);
+    try {
+      await Zotero.File.putContentsAsync(marksFile, marksContent);
+      return await this.runGsRewrite(pdfPath, {
+        flags: "-dPassThroughJPEGImages=true",
+        trailingFile: marksFile,
+        statusText: "Adding bookmarks & metadata",
+        shouldReplace: (inputSize, outputSize) => outputSize < inputSize * 1.25
+      }, progress, getBatchPrefix);
+    } finally {
+      try { await IOUtils.remove(marksFile); } catch (e) {}
+    }
+  }
+
   async runDdjvuWithProgress(inputPath, outputPath, progress, getBatchPrefix = () => "", removeCover = false) {
     if (!inputPath || !outputPath) {
       throw new Error("Missing input or output path");
@@ -4173,6 +4428,9 @@ class ZoteroDJVUConverter {
     if (totalPages) {
       this.log(`DJVU has ${totalPages} pages`);
     }
+
+    // Extract the outline (table of contents) while the safe temp copy exists
+    const outline = await this.getDjvuOutline(tempInputPath);
 
     // Clean up any leftover files from previous cancelled runs
     try { await IOUtils.remove(markerFile); } catch (e) {}
@@ -4277,7 +4535,11 @@ class ZoteroDJVUConverter {
             }
             await cleanupTempFiles();
             this.log("DJVU conversion complete");
-            resolve(true);
+            resolve({
+              outline,
+              coverRemoved: pageRange !== "",
+              pageCount: totalPages
+            });
           } else if (error) {
             clearInterval(checkInterval);
             this._activeProcesses.delete(pidFile);
