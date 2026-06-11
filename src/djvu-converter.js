@@ -2,6 +2,11 @@ class ZoteroDJVUConverter {
   // Timeouts (in milliseconds)
   static TIMEOUT_OCR = 1800000;          // 30 minutes for OCR
   static TIMEOUT_CONVERSION = 300000;    // 5 minutes for DJVU conversion
+  static TIMEOUT_DOWNSAMPLE = 600000;    // 10 minutes for ghostscript downsampling
+
+  // Lossy downsampling targets (only used when the user opts in)
+  static DOWNSAMPLE_COLOR_DPI = 200;     // Color/grayscale images
+  static DOWNSAMPLE_MONO_DPI = 300;      // B/W images (kept higher for text legibility)
 
   // Polling intervals (in milliseconds)
   static POLL_INTERVAL_FAST = 500;       // For conversion/compression
@@ -298,6 +303,57 @@ class ZoteroDJVUConverter {
     }
 
     return { container, radios };
+  }
+
+  // Append a hint about missing optional optimizers under compression controls
+  // (without them, Medium/Maximum barely outperform Light on scanned books)
+  appendCompressionHint(doc, container) {
+    const missing = [];
+    if (!this.jbig2Found) missing.push("jbig2enc");
+    if (!this.pngquantFound) missing.push("pngquant");
+    if (missing.length > 0) {
+      container.appendChild(this.createDisabledNote(doc, `Tip: install ${missing.join(" and ")} for stronger compression`));
+    }
+  }
+
+  // Create the lossy compression options section (both off by default)
+  // Returns { container, getOptions }
+  createLossyOptionsSection(doc, idPrefix) {
+    const S = ZoteroDJVUConverter.STYLES;
+    const container = this.createSection(doc);
+
+    const label = doc.createElement("div");
+    label.textContent = "Aggressive compression (lossy):";
+    label.style.cssText = S.LABEL_SMALL;
+    container.appendChild(label);
+
+    const jbig2Available = this.jbig2Found && this.ocrmypdfFound;
+    const { label: jbig2Label, checkbox: jbig2Check } = this.createCheckbox(
+      doc, `${idPrefix}-jbig2-lossy`,
+      jbig2Available
+        ? "Lossy JBIG2 for B/W pages (may alter similar-looking characters)"
+        : "Lossy JBIG2 for B/W pages (install jbig2enc to enable)",
+      false, !jbig2Available
+    );
+    container.appendChild(jbig2Label);
+
+    const gsAvailable = !!this.gsPath;
+    const { label: dsLabel, checkbox: dsCheck } = this.createCheckbox(
+      doc, `${idPrefix}-downsample`,
+      gsAvailable
+        ? `Downsample images to ${ZoteroDJVUConverter.DOWNSAMPLE_COLOR_DPI} DPI (visibly lossy)`
+        : "Downsample images (install ghostscript to enable)",
+      false, !gsAvailable
+    );
+    container.appendChild(dsLabel);
+
+    return {
+      container,
+      getOptions: () => ({
+        jbig2Lossy: jbig2Available && jbig2Check.checked,
+        downsample: gsAvailable && dsCheck.checked
+      })
+    };
   }
 
   // Create disabled feature note
@@ -733,7 +789,7 @@ class ZoteroDJVUConverter {
           };
           progress.updateText(`${getBatchPrefix()}Compressing: ${filename}`);
 
-          const sizeInfo = await this.compressSinglePdf(item, filePath, options.compressLevel, progress, globalFileNum, getBatchPrefix);
+          const sizeInfo = await this.compressSinglePdf(item, filePath, options, progress, globalFileNum, getBatchPrefix);
           successCount++;
           if (sizeInfo) {
             lastSizeInfo = sizeInfo;
@@ -1163,6 +1219,21 @@ class ZoteroDJVUConverter {
       this.pdfinfoPath = await this.findExecutable("pdfinfo");
       if (this.pdfinfoPath) this.log(`Found pdfinfo at: ${this.pdfinfoPath}`);
 
+      // Optional optimizers that greatly improve ocrmypdf compression
+      // (jbig2enc for scanned B/W pages, pngquant for PNG quantization)
+      this.pngquantFound = !!(await this.findExecutable("pngquant"));
+      this.jbig2Found = !!(await this.findExecutable("jbig2"));
+      this.log(`Optional optimizers: pngquant=${this.pngquantFound}, jbig2=${this.jbig2Found}`);
+
+      // Also check for qpdf/ghostscript (used for removing cover page from PDFs)
+      this.qpdfPath = await this.findExecutable("qpdf");
+      if (this.qpdfPath) this.log(`Found qpdf at: ${this.qpdfPath}`);
+      this.gsPath = await this.findExecutable("gs");
+      if (!this.gsPath && this.isWindows()) {
+        this.gsPath = (await this.findExecutable("gswin64c")) || (await this.findExecutable("gswin32c"));
+      }
+      if (this.gsPath) this.log(`Found ghostscript at: ${this.gsPath}`);
+
       // Show dependency check popup
       this.showDependencyCheck();
     } catch (e) {
@@ -1211,6 +1282,187 @@ class ZoteroDJVUConverter {
       this.log(`Error getting page count: ${e.message}`);
       return null;
     }
+  }
+
+  // Check if cover page removal is available for existing PDFs
+  canRemovePdfCover() {
+    return !!(this.qpdfPath || this.gsPath);
+  }
+
+  // Remove the first page (cover) from a PDF in place using qpdf or ghostscript
+  // Returns true if the page was removed, false if skipped or failed
+  async removeFirstPdfPage(pdfPath) {
+    if (!this.canRemovePdfCover()) {
+      this.log("Cannot remove cover: qpdf/ghostscript not found");
+      return false;
+    }
+
+    const pageCount = await this.getPdfPageCount(pdfPath);
+    if (pageCount !== null && pageCount <= 1) {
+      this.log("Skipping cover removal: PDF has only one page");
+      return false;
+    }
+
+    // Use temp paths with safe ASCII names to avoid shell escaping issues
+    const tempDir = Zotero.getTempDirectory().path;
+    const tempId = `djvu_conv_cover_${Date.now()}`;
+    const tempInput = PathUtils.join(tempDir, `${tempId}_in.pdf`);
+    const tempOutput = PathUtils.join(tempDir, `${tempId}_out.pdf`);
+
+    try {
+      await IOUtils.copy(pdfPath, tempInput);
+
+      let cmd;
+      if (this.qpdfPath) {
+        // qpdf keeps pages 2 to last (z) without re-encoding images
+        cmd = `"${this.qpdfPath}" "${tempInput}" --pages . 2-z -- "${tempOutput}"`;
+      } else {
+        cmd = `"${this.gsPath}" -q -dNOPAUSE -dBATCH -sDEVICE=pdfwrite -dFirstPage=2 -sOutputFile="${tempOutput}" "${tempInput}"`;
+      }
+
+      if (this.isWindows()) {
+        await Zotero.Utilities.Internal.exec("cmd.exe", ["/c", `${cmd} 2>nul`]);
+      } else {
+        await Zotero.Utilities.Internal.exec("/bin/sh", ["-c", `export LANG=en_US.UTF-8; ${cmd} 2>/dev/null`]);
+      }
+
+      // Verify output before replacing the original
+      let outputSize = 0;
+      try {
+        const stat = await IOUtils.stat(tempOutput);
+        outputSize = stat.size;
+      } catch (e) {}
+
+      if (outputSize > 0) {
+        // Copy (not move) - temp dir may be on a different volume; temps are removed in finally
+        await IOUtils.copy(tempOutput, pdfPath);
+        this.log(`Removed cover page from PDF: ${this.getBasename(pdfPath)}`);
+        return true;
+      }
+
+      this.log("Cover removal produced no output, keeping original");
+      return false;
+    } catch (e) {
+      this.log(`Cover removal failed: ${e.message}`);
+      return false;
+    } finally {
+      try { await IOUtils.remove(tempInput); } catch (e) {}
+      try { await IOUtils.remove(tempOutput); } catch (e) {}
+    }
+  }
+
+  // Downsample images in a PDF in place using Ghostscript (lossy, opt-in)
+  // Only replaces the file if the result is smaller. Returns true if replaced.
+  async downsamplePdfImages(pdfPath, progress, getBatchPrefix = () => "") {
+    if (!this.gsPath) {
+      this.log("Cannot downsample: ghostscript not found");
+      return false;
+    }
+
+    const inputSize = this.getFileSize(pdfPath);
+
+    // Use temp paths with safe ASCII names to avoid shell escaping issues
+    const tempDir = Zotero.getTempDirectory().path;
+    const tempId = `djvu_conv_downsample_${Date.now()}`;
+    const tempInput = PathUtils.join(tempDir, `${tempId}_in.pdf`);
+    const tempOutput = PathUtils.join(tempDir, `${tempId}_out.pdf`);
+    const markerFile = PathUtils.join(tempDir, `${tempId}.done`);
+    const errorFile = PathUtils.join(tempDir, `${tempId}.error`);
+    const pidFile = PathUtils.join(tempDir, `${tempId}.pid`);
+
+    try {
+      await IOUtils.copy(pdfPath, tempInput);
+    } catch (e) {
+      this.log(`Downsample: failed to copy input: ${e.message}`);
+      return false;
+    }
+
+    const colorDpi = ZoteroDJVUConverter.DOWNSAMPLE_COLOR_DPI;
+    const monoDpi = ZoteroDJVUConverter.DOWNSAMPLE_MONO_DPI;
+    // /ebook preset provides sane image re-encoding settings; explicit flags
+    // after it override its resolutions. Threshold 1.0 downsamples any image
+    // above the target resolution.
+    const gsCmd = `"${this.gsPath}" -q -dNOPAUSE -dBATCH -sDEVICE=pdfwrite -dPDFSETTINGS=/ebook ` +
+      `-dColorImageResolution=${colorDpi} -dColorImageDownsampleThreshold=1.0 ` +
+      `-dGrayImageResolution=${colorDpi} -dGrayImageDownsampleThreshold=1.0 ` +
+      `-dMonoImageResolution=${monoDpi} -dMonoImageDownsampleThreshold=1.0 ` +
+      `-sOutputFile="${tempOutput}" "${tempInput}"`;
+
+    // Process pattern for kill on Windows (gswin64c) vs Unix (gs)
+    const gsPattern = this.getBasename(this.gsPath).replace(/\.(exe|bat|cmd)$/i, "");
+
+    this.startBackgroundProcess(gsCmd, markerFile, errorFile, pidFile);
+    this._activeProcesses.set(pidFile, gsPattern);
+
+    const cleanup = async () => {
+      for (const f of [tempInput, tempOutput, markerFile, errorFile, pidFile]) {
+        try { await IOUtils.remove(f); } catch (e) {}
+      }
+    };
+
+    return new Promise((resolve) => {
+      const startTime = Date.now();
+
+      const checkInterval = setInterval(async () => {
+        try {
+          if (progress.cancelled) {
+            clearInterval(checkInterval);
+            await this.killBackgroundProcess(pidFile, gsPattern);
+            this._activeProcesses.delete(pidFile);
+            await cleanup();
+            this.log("Downsampling cancelled");
+            resolve(false);
+            return;
+          }
+
+          const elapsedSec = Math.floor((Date.now() - startTime) / 1000);
+          progress.updateText(`${getBatchPrefix()}Downsampling images • ${elapsedSec}s`);
+
+          let done = false;
+          let error = false;
+          try { done = await IOUtils.exists(markerFile); } catch (e) {}
+          try { error = await IOUtils.exists(errorFile); } catch (e) {}
+
+          if (done) {
+            clearInterval(checkInterval);
+            this._activeProcesses.delete(pidFile);
+            const outputSize = this.getFileSize(tempOutput);
+            let replaced = false;
+            if (outputSize > 0 && outputSize < inputSize) {
+              try {
+                await IOUtils.copy(tempOutput, pdfPath);
+                this.log(`Downsampled: ${this.formatSize(inputSize)} -> ${this.formatSize(outputSize)}`);
+                replaced = true;
+              } catch (e) {
+                this.log(`Downsample: failed to replace original: ${e.message}`);
+              }
+            } else {
+              this.log(`Downsampling did not reduce size (${this.formatSize(outputSize)}), keeping original`);
+            }
+            await cleanup();
+            resolve(replaced);
+          } else if (error) {
+            clearInterval(checkInterval);
+            this._activeProcesses.delete(pidFile);
+            await cleanup();
+            this.log("Downsampling failed, keeping original");
+            resolve(false);
+          } else if (Date.now() - startTime >= ZoteroDJVUConverter.TIMEOUT_DOWNSAMPLE) {
+            clearInterval(checkInterval);
+            await this.killBackgroundProcess(pidFile, gsPattern);
+            this._activeProcesses.delete(pidFile);
+            await cleanup();
+            this.log("Downsampling timed out, keeping original");
+            resolve(false);
+          }
+        } catch (e) {
+          clearInterval(checkInterval);
+          this.log(`Error in downsample polling: ${e.message}`);
+          await cleanup();
+          resolve(false);
+        }
+      }, ZoteroDJVUConverter.POLL_INTERVAL_FAST);
+    });
   }
 
   // Find executable on PATH using `which` (Unix) or `where` (Windows)
@@ -1656,7 +1908,7 @@ class ZoteroDJVUConverter {
       options.addOcr = false;
     }
 
-    this.log(`Options: OCR=${options.addOcr}, compressLevel=${options.compressLevel}, deleteOriginal=${options.deleteOriginal}`);
+    this.log(`Options: OCR=${options.addOcr}, compressLevel=${options.compressLevel}, deleteOriginal=${options.deleteOriginal}, removeCover=${options.removeCover}`);
 
     // Queue or execute the conversion
     await this.enqueueOperation("convert", djvuItems, options);
@@ -1732,6 +1984,12 @@ class ZoteroDJVUConverter {
       langContainer.appendChild(langGrid);
       dialog.appendChild(langContainer);
 
+      // Remove cover checkbox (covers are often heavy scanned images)
+      const { label: coverLabel, checkbox: coverCheckbox } = this.createCheckbox(
+        doc, "djvu-batch-remove-cover", "Remove cover (first page) from each file", false
+      );
+      dialog.appendChild(coverLabel);
+
       // Show/hide language selector based on OCR checkbox
       const updateLangVisibility = () => {
         langContainer.style.display = ocrCheckbox.checked ? "block" : "none";
@@ -1758,8 +2016,14 @@ class ZoteroDJVUConverter {
 
       if (!hasCompress) {
         compressContainer.appendChild(this.createDisabledNote(doc, "Install ocrmypdf to enable compression"));
+      } else {
+        this.appendCompressionHint(doc, compressContainer);
       }
       dialog.appendChild(compressContainer);
+
+      // Lossy compression options (off by default)
+      const lossySection = this.createLossyOptionsSection(doc, "djvu-batch-convert");
+      dialog.appendChild(lossySection.container);
 
       // After conversion label
       const afterLabel = doc.createElement("div");
@@ -1809,7 +2073,9 @@ class ZoteroDJVUConverter {
           addOcr: ocrCheckbox.checked,
           ocrLanguages: ocrLangs,
           compressLevel: compressSelect.value,
-          deleteOriginal: replaceRadio.checked
+          deleteOriginal: replaceRadio.checked,
+          removeCover: coverCheckbox.checked,
+          ...lossySection.getOptions()
         });
       });
 
@@ -2030,6 +2296,7 @@ class ZoteroDJVUConverter {
       ];
       const compressSelect = this.createSelect(doc, compressLevels, "1");
       compressContainer.appendChild(compressSelect);
+      this.appendCompressionHint(doc, compressContainer);
       dialog.appendChild(compressContainer);
 
       // Cleanup function
@@ -2129,32 +2396,49 @@ class ZoteroDJVUConverter {
     }
 
     // Show options dialog (single or batch)
-    let compressLevel;
+    let options;
     if (pdfItems.length === 1) {
       const item = pdfItems[0];
       const filePath = await item.getFilePathAsync();
       const filename = item.getField("title") || this.getBasename(filePath) || "file.pdf";
       const fileSize = this.getFileSize(filePath);
-      compressLevel = await this.showCompressionOptionsDialog(filename, fileSize);
+      options = await this.showCompressionOptionsDialog(filename, fileSize);
     } else {
-      compressLevel = await this.showBatchCompressionOptionsDialog(pdfItems.length);
+      options = await this.showBatchCompressionOptionsDialog(pdfItems.length);
     }
 
-    if (!compressLevel) {
+    if (!options) {
       this.log("User cancelled compression");
       return;
     }
 
-    this.log(`Compression level: ${compressLevel}`);
+    this.log(`Compression level: ${options.compressLevel}, removeCover=${options.removeCover}`);
 
     // Queue or execute the compression operation
-    await this.enqueueOperation("compress", pdfItems, { compressLevel });
+    await this.enqueueOperation("compress", pdfItems, options);
   }
 
-  async compressSinglePdf(item, filePath, optimizeLevel, progress, fileNum, getBatchPrefix) {
+  async compressSinglePdf(item, filePath, options, progress, fileNum, getBatchPrefix) {
     const filename = this.getBasename(filePath);
     this.log(`Compressing file ${fileNum}: ${filename}`);
 
+    // Size before any modification, so reported savings include cover removal
+    const originalSize = this.getFileSize(filePath);
+
+    // Remove cover first so compression runs on the final page set
+    let coverRemoved = false;
+    if (options.removeCover) {
+      progress.updateText(`${getBatchPrefix()}Removing cover: ${this.truncateFilename(filename, 30)}`);
+      coverRemoved = await this.removeFirstPdfPage(filePath);
+    }
+
+    // Optional lossy image downsampling (off by default)
+    let downsampled = false;
+    if (options.downsample && !progress.cancelled) {
+      downsampled = await this.downsamplePdfImages(filePath, progress, getBatchPrefix);
+    }
+
+    const optimizeLevel = ZoteroDJVUConverter.getOptimizeLevel(options.compressLevel);
     const compressedPath = filePath.replace(/\.pdf$/i, "_compressed.pdf");
     const pageCount = await this.getPdfPageCount(filePath);
 
@@ -2168,7 +2452,8 @@ class ZoteroDJVUConverter {
         pageCount,
         optimizeLevel,
         true,       // skipOcr - only compress, no OCR
-        getBatchPrefix
+        getBatchPrefix,
+        options.jbig2Lossy
       );
 
       if (success && Zotero.File.pathToFile(compressedPath).exists()) {
@@ -2191,12 +2476,13 @@ class ZoteroDJVUConverter {
           await IOUtils.move(compressedPath, filePath);
           const savings = Math.round((1 - outputSize / inputSize) * 100);
           this.log(`Successfully compressed: ${filename} (${savings}% smaller)`);
-          return { inputSize, outputSize, replaced: true };
+          return { inputSize: originalSize || inputSize, outputSize, replaced: true };
         } else {
           // Compressed file is same size or larger - keep original
+          // (still counts as replaced if the cover was removed or images downsampled)
           try { await IOUtils.remove(compressedPath); } catch (err) {}
           this.log(`Skipped ${filename}: compression would not reduce size`);
-          return { inputSize, outputSize: inputSize, replaced: false };
+          return { inputSize: originalSize || inputSize, outputSize: inputSize, replaced: coverRemoved || downsampled };
         }
       } else {
         throw new Error("Compression output not created");
@@ -2237,12 +2523,26 @@ class ZoteroDJVUConverter {
       const levels = [
         { value: "light", label: "Light (lossless, best quality)" },
         { value: "medium", label: "Medium (recommended)" },
-        { value: "strong", label: "Strong (smaller files)" },
         { value: "maximum", label: "Maximum (smallest files)" }
       ];
       const levelSelect = this.createSelect(doc, levels, "medium");
       compressContainer.appendChild(levelSelect);
+      this.appendCompressionHint(doc, compressContainer);
       dialog.appendChild(compressContainer);
+
+      // Lossy compression options (off by default)
+      const lossySection = this.createLossyOptionsSection(doc, "djvu-batch-compress");
+      dialog.appendChild(lossySection.container);
+
+      // Remove cover checkbox (covers are often heavy scanned images)
+      const coverAvailable = this.canRemovePdfCover();
+      const { label: coverLabel, checkbox: coverCheck } = this.createCheckbox(
+        doc, "djvu-compress-remove-cover", "Remove cover (first page) from each file", false, !coverAvailable
+      );
+      dialog.appendChild(coverLabel);
+      if (!coverAvailable) {
+        dialog.appendChild(this.createDisabledNote(doc, "Install qpdf to enable cover removal"));
+      }
 
       // Cleanup function
       const cleanup = () => {
@@ -2271,7 +2571,11 @@ class ZoteroDJVUConverter {
 
       const compressBtn = this.createButton(doc, `Compress ${fileCount} Files`, true, () => {
         cleanup();
-        resolve(levelSelect.value);
+        resolve({
+          compressLevel: levelSelect.value,
+          removeCover: coverCheck.checked,
+          ...lossySection.getOptions()
+        });
       });
 
       buttonContainer.appendChild(cancelBtn);
@@ -2406,6 +2710,7 @@ class ZoteroDJVUConverter {
       const optimizeSelect = this.createSelect(doc, optimizeOptions, "medium");
       optimizeSelect.style.marginBottom = "20px";
       dialog.appendChild(optimizeSelect);
+      this.appendCompressionHint(doc, dialog);
 
       // Cleanup function
       const cleanup = () => {
@@ -2474,8 +2779,24 @@ class ZoteroDJVUConverter {
         { value: "maximum", label: "Maximum (smallest file)" }
       ];
       const levelSelect = this.createSelect(doc, levels, "medium");
-      levelSelect.style.marginBottom = "20px";
+      levelSelect.style.marginBottom = "16px";
       dialog.appendChild(levelSelect);
+      this.appendCompressionHint(doc, dialog);
+
+      // Lossy compression options (off by default)
+      const lossySection = this.createLossyOptionsSection(doc, "djvu-compress");
+      dialog.appendChild(lossySection.container);
+
+      // Remove cover checkbox (covers are often heavy scanned images)
+      const coverAvailable = this.canRemovePdfCover();
+      const { label: coverLabel, checkbox: coverCheck } = this.createCheckbox(
+        doc, "djvu-compress-remove-cover", "Remove cover (first page)", false, !coverAvailable
+      );
+      coverLabel.style.marginBottom = "20px";
+      dialog.appendChild(coverLabel);
+      if (!coverAvailable) {
+        dialog.appendChild(this.createDisabledNote(doc, "Install qpdf to enable cover removal"));
+      }
 
       // Cleanup function
       const cleanup = () => {
@@ -2491,7 +2812,11 @@ class ZoteroDJVUConverter {
       }));
       const compressBtn = this.createButton(doc, "Compress", true, () => {
         cleanup();
-        resolve(levelSelect.value);
+        resolve({
+          compressLevel: levelSelect.value,
+          removeCover: coverCheck.checked,
+          ...lossySection.getOptions()
+        });
       });
       buttons.appendChild(compressBtn);
 
@@ -2894,7 +3219,7 @@ class ZoteroDJVUConverter {
       options.addOcr = false;
     }
 
-    this.log(`Auto-convert options: OCR=${options.addOcr}, compressLevel=${options.compressLevel}, deleteOriginal=${options.deleteOriginal}`);
+    this.log(`Auto-convert options: OCR=${options.addOcr}, compressLevel=${options.compressLevel}, deleteOriginal=${options.deleteOriginal}, removeCover=${options.removeCover}`);
 
     // Mark items as being processed to prevent duplicate handling
     const itemIds = djvuItems.map(item => item.id);
@@ -2983,6 +3308,12 @@ class ZoteroDJVUConverter {
       langContainer.appendChild(langGrid);
       dialog.appendChild(langContainer);
 
+      // Remove cover checkbox (covers are often heavy scanned images)
+      const { label: coverLabel, checkbox: coverCheck } = this.createCheckbox(
+        doc, "djvu-remove-cover", "Remove cover (first page)", false
+      );
+      dialog.appendChild(coverLabel);
+
       // Compression dropdown (always visible, independent of OCR)
       const compressContainer = this.createSection(doc);
       const compressAvailable = this.ocrmypdfFound;
@@ -3003,9 +3334,15 @@ class ZoteroDJVUConverter {
 
       if (!compressAvailable) {
         compressContainer.appendChild(this.createDisabledNote(doc, "Install ocrmypdf to enable compression"));
+      } else {
+        this.appendCompressionHint(doc, compressContainer);
       }
 
       dialog.appendChild(compressContainer);
+
+      // Lossy compression options (off by default)
+      const lossySection = this.createLossyOptionsSection(doc, "djvu-convert");
+      dialog.appendChild(lossySection.container);
 
       // Show/hide language selector based on OCR checkbox
       const updateVisibility = () => {
@@ -3052,7 +3389,9 @@ class ZoteroDJVUConverter {
           addOcr: ocrCheck.checked,
           compressLevel: compressLevel,
           deleteOriginal: replaceRadio.checked,
-          ocrLanguages: ocrLangs
+          ocrLanguages: ocrLangs,
+          removeCover: coverCheck.checked,
+          ...lossySection.getOptions()
         });
       });
       buttons.appendChild(convertBtn);
@@ -3288,7 +3627,7 @@ class ZoteroDJVUConverter {
     const tempPdfPath = filePath.replace(/\.(djvu|djv)$/i, ".pdf");
     this.log(`Converting: ${filePath} -> ${tempPdfPath}`);
 
-    await this.runDdjvuWithProgress(filePath, tempPdfPath, progress, getBatchPrefix);
+    await this.runDdjvuWithProgress(filePath, tempPdfPath, progress, getBatchPrefix, options.removeCover);
 
     // Get converted PDF size
     let convertedSize = 0;
@@ -3315,6 +3654,12 @@ class ZoteroDJVUConverter {
       throw new Error("Cancelled by user");
     }
 
+    // Step 1.5: Optional lossy image downsampling (off by default)
+    // Done before OCR/compression so jbig2/pngquant optimization survives in the final file
+    if (options.downsample && !progress.cancelled) {
+      await this.downsamplePdfImages(tempPdfPath, progress, getBatchPrefix);
+    }
+
     // Step 2: Run ocrmypdf for OCR and/or compression
     const needsOcr = options.addOcr;
     const needsCompression = options.compressLevel && options.compressLevel !== "none";
@@ -3323,6 +3668,8 @@ class ZoteroDJVUConverter {
     if ((needsOcr || needsCompression) && this.ocrmypdfFound) {
       const ocrPdfPath = tempPdfPath.replace(/\.pdf$/i, "_ocr.pdf");
       const pageCount = await this.getPdfPageCount(tempPdfPath);
+      // Baseline for the keep-smaller check (after possible downsampling)
+      const preOptimizeSize = this.getFileSize(tempPdfPath);
 
       try {
         const ocrSuccess = await this.runOcrWithProgress(
@@ -3334,12 +3681,24 @@ class ZoteroDJVUConverter {
           pageCount,
           optimizeLevel,
           !needsOcr,
-          getBatchPrefix
+          getBatchPrefix,
+          options.jbig2Lossy
         );
 
         if (ocrSuccess && Zotero.File.pathToFile(ocrPdfPath).exists()) {
-          await IOUtils.remove(tempPdfPath);
-          await IOUtils.move(ocrPdfPath, tempPdfPath);
+          const processedSize = this.getFileSize(ocrPdfPath);
+          if (!needsOcr && processedSize > 0 && preOptimizeSize > 0 && processedSize >= preOptimizeSize) {
+            // Compression-only: "optimized" file is not smaller, keep the unprocessed PDF
+            this.log(`Discarding compression result for ${filename}: ${this.formatSize(processedSize)} >= ${this.formatSize(preOptimizeSize)}`);
+            try { await IOUtils.remove(ocrPdfPath); } catch (e) {}
+          } else {
+            // OCR output is kept even if larger - the text layer is the point
+            if (needsOcr && processedSize >= preOptimizeSize && needsCompression) {
+              this.log(`OCR output larger than input (${this.formatSize(preOptimizeSize)} -> ${this.formatSize(processedSize)}), keeping for text layer`);
+            }
+            await IOUtils.remove(tempPdfPath);
+            await IOUtils.move(ocrPdfPath, tempPdfPath);
+          }
         }
       } catch (ocrError) {
         if (ocrError.message.includes("Cancelled by user") || progress.cancelled) {
@@ -3485,7 +3844,7 @@ class ZoteroDJVUConverter {
 
   // Build the ocrmypdf command string
   buildOcrmypdfCommand(inputPath, outputPath, errorLogFile, options = {}) {
-    const { forceOcr = false, languages = 'eng', optimizeLevel = 1, skipOcr = false } = options;
+    const { forceOcr = false, languages = 'eng', optimizeLevel = 1, skipOcr = false, jbig2Lossy = false } = options;
 
     // Validate language string (only allow alphanumeric, underscore, plus)
     let safeLangs = (languages || 'eng').replace(/[^a-zA-Z0-9_+]/g, '');
@@ -3495,19 +3854,24 @@ class ZoteroDJVUConverter {
     const skipBig = ZoteroDJVUConverter.OCR_SKIP_BIG_MB;
     const tessTimeout = skipOcr ? 0 : ZoteroDJVUConverter.OCR_TESSERACT_TIMEOUT;
     const optLevel = optimizeLevel >= 0 && optimizeLevel <= 3 ? optimizeLevel : 1;
+    // Compression-only: skip PDF/A conversion, which can inflate scanned files
+    // (older ocrmypdf versions run the file through Ghostscript by default)
+    const outputType = skipOcr ? "--output-type pdf " : "";
+    // Lossy JBIG2 only applies when the optimizer runs and jbig2enc is present
+    const jbig2Flag = (jbig2Lossy && this.jbig2Found && optLevel >= 1) ? "--jbig2-lossy " : "";
 
     if (this.isWindows()) {
       const escapedInput = this.escapeWindowsPath(inputPath);
       const escapedOutput = this.escapeWindowsPath(outputPath);
       const escapedLogFile = this.escapeWindowsPath(errorLogFile);
       const escapedTool = this.escapeWindowsPath(this.ocrmypdfPath);
-      return `"${escapedTool}" -O ${optLevel} ${ocrMode} --skip-big ${skipBig} --tesseract-timeout ${tessTimeout} -v 1 -l ${safeLangs} "${escapedInput}" "${escapedOutput}" 2>"${escapedLogFile}"`;
+      return `"${escapedTool}" -O ${optLevel} ${outputType}${jbig2Flag}${ocrMode} --skip-big ${skipBig} --tesseract-timeout ${tessTimeout} -v 1 -l ${safeLangs} "${escapedInput}" "${escapedOutput}" 2>"${escapedLogFile}"`;
     } else {
       const pathExport = this.getPathExport();
       const escapedInput = this.escapeShellPath(inputPath);
       const escapedOutput = this.escapeShellPath(outputPath);
       const escapedLogFile = this.escapeShellPath(errorLogFile);
-      return `${pathExport} "${this.ocrmypdfPath}" -O ${optLevel} ${ocrMode} --skip-big ${skipBig} --tesseract-timeout ${tessTimeout} -v 1 -l ${safeLangs} "${escapedInput}" "${escapedOutput}" 2>"${escapedLogFile}"`;
+      return `${pathExport} "${this.ocrmypdfPath}" -O ${optLevel} ${outputType}${jbig2Flag}${ocrMode} --skip-big ${skipBig} --tesseract-timeout ${tessTimeout} -v 1 -l ${safeLangs} "${escapedInput}" "${escapedOutput}" 2>"${escapedLogFile}"`;
     }
   }
 
@@ -3569,7 +3933,7 @@ class ZoteroDJVUConverter {
     }
   }
 
-  async runOcrWithProgress(inputPath, outputPath, progress, forceOcr = false, languages = "eng", pageCount = null, optimizeLevel = 1, skipOcr = false, getBatchPrefix = () => "") {
+  async runOcrWithProgress(inputPath, outputPath, progress, forceOcr = false, languages = "eng", pageCount = null, optimizeLevel = 1, skipOcr = false, getBatchPrefix = () => "", jbig2Lossy = false) {
     const modeDesc = skipOcr ? "compression-only" : (forceOcr ? "force-OCR" : "OCR");
     this.log(`Starting ${modeDesc} process...`);
 
@@ -3602,7 +3966,7 @@ class ZoteroDJVUConverter {
 
     // Build command using helper with safe temp paths
     const ocrCmd = this.buildOcrmypdfCommand(tempInputPath, tempOutputPath, errorLogFile, {
-      forceOcr, languages, optimizeLevel, skipOcr
+      forceOcr, languages, optimizeLevel, skipOcr, jbig2Lossy
     });
     this.log(`OCR command: ${ocrCmd}`);
 
@@ -3778,7 +4142,7 @@ class ZoteroDJVUConverter {
     }
   }
 
-  async runDdjvuWithProgress(inputPath, outputPath, progress, getBatchPrefix = () => "") {
+  async runDdjvuWithProgress(inputPath, outputPath, progress, getBatchPrefix = () => "", removeCover = false) {
     if (!inputPath || !outputPath) {
       throw new Error("Missing input or output path");
     }
@@ -3818,6 +4182,17 @@ class ZoteroDJVUConverter {
     try { await IOUtils.remove(tempOutputPath); } catch (e) {}
     try { await IOUtils.remove(outputPath); } catch (e) {}
 
+    // Skip the first page (cover) when requested - needs a known page count for the range
+    let pageRange = "";
+    if (removeCover) {
+      if (totalPages && totalPages > 1) {
+        pageRange = ` -page=2-${totalPages}`;
+        this.log("Removing cover: converting pages 2-" + totalPages);
+      } else {
+        this.log("Cannot remove cover: page count unknown or single page, converting all pages");
+      }
+    }
+
     // Build the ddjvu command with -verbose for progress (cross-platform)
     // Using temp paths which only contain safe ASCII characters
     let ddjvuCmd;
@@ -3826,10 +4201,10 @@ class ZoteroDJVUConverter {
       const escapedOutput = this.escapeWindowsPath(tempOutputPath);
       const escapedTool = this.escapeWindowsPath(this.ddjvuPath);
       const escapedLog = this.escapeWindowsPath(logFile);
-      ddjvuCmd = `"${escapedTool}" -format=pdf -verbose "${escapedInput}" "${escapedOutput}" 2>"${escapedLog}"`;
+      ddjvuCmd = `"${escapedTool}" -format=pdf${pageRange} -verbose "${escapedInput}" "${escapedOutput}" 2>"${escapedLog}"`;
     } else {
       // Temp paths are safe ASCII, no escaping needed but we still quote them
-      ddjvuCmd = `export LANG=en_US.UTF-8; "${this.ddjvuPath}" -format=pdf -verbose "${tempInputPath}" "${tempOutputPath}" 2>"${logFile}"`;
+      ddjvuCmd = `export LANG=en_US.UTF-8; "${this.ddjvuPath}" -format=pdf${pageRange} -verbose "${tempInputPath}" "${tempOutputPath}" 2>"${logFile}"`;
     }
 
     // Start background process using helper

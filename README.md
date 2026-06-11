@@ -13,6 +13,7 @@ A Zotero 7/8 plugin that converts DJVU files to PDF with optional OCR and compre
 - **Manual Conversion**: Right-click context menu for converting DJVU files
 - **OCR Support**: Add searchable text layer to PDFs (supports 12 languages)
 - **PDF Compression**: Reduce file size using ocrmypdf optimization
+- **Cover Removal**: Optionally drop the first page (cover) — scanned covers often account for much of the file size
 - **Flexible Options**: Choose to replace original or keep both files
 - **Progress Tracking**: Visual progress with cancel button
 - **Size Reporting**: Shows file size at each conversion stage
@@ -34,6 +35,9 @@ brew install djvulibre
 
 # Required for OCR and PDF compression
 brew install ocrmypdf tesseract tesseract-lang
+
+# Optional: much stronger compression of scanned books + cover removal
+brew install jbig2enc pngquant qpdf
 ```
 
 #### Linux (Debian/Ubuntu)
@@ -44,6 +48,9 @@ sudo apt install djvulibre-bin
 
 # Required for OCR and PDF compression
 sudo apt install ocrmypdf tesseract-ocr tesseract-ocr-eng
+
+# Optional: much stronger compression of scanned books + cover removal
+sudo apt install pngquant qpdf
 ```
 
 #### Linux (Fedora/RHEL)
@@ -54,6 +61,9 @@ sudo dnf install djvulibre
 
 # Required for OCR and PDF compression
 sudo dnf install ocrmypdf tesseract tesseract-langpack-eng
+
+# Optional: much stronger compression of scanned books + cover removal
+sudo dnf install pngquant qpdf
 ```
 
 #### Windows
@@ -101,7 +111,10 @@ Right-click on items in your library to access:
 |--------|-------------|
 | Add OCR text layer | Makes the PDF searchable (requires ocrmypdf + tesseract) |
 | OCR Languages | Select one or more languages for OCR |
+| Remove cover (first page) | Skips the cover page; in the Compress PDF dialog this requires qpdf or ghostscript |
 | Compress PDF | Reduces file size (requires ocrmypdf) |
+| Lossy JBIG2 | Off by default. Much smaller B/W scans, but may substitute similar-looking characters (requires jbig2enc) |
+| Downsample images to 200 DPI | Off by default. Visibly lossy; biggest size reduction for high-resolution scans (requires ghostscript). May slightly reduce OCR accuracy when combined with OCR |
 | Replace DJVU with PDF | Removes original DJVU after conversion |
 | Keep both files | Adds PDF as sibling attachment |
 
@@ -163,6 +176,19 @@ Make sure the required language pack is installed:
 - **Windows**: Download language packs from [Tesseract GitHub](https://github.com/tesseract-ocr/tessdata)
 
 ## Changelog
+
+### v1.7.0
+- **Cover Removal**: New "Remove cover (first page)" option in conversion and compression dialogs — covers are often heavy scanned images
+  - During DJVU conversion: handled natively by ddjvu (no extra dependencies)
+  - During PDF compression: uses qpdf (lossless) or ghostscript as fallback
+- **Compression Fixes**:
+  - Conversion no longer keeps a "compressed" PDF that came out larger than the uncompressed one
+  - Compression level selection in the Compress PDF dialogs now actually takes effect (previously all levels ran as Light)
+  - Compression-only runs use `--output-type pdf`, skipping the PDF/A conversion that could inflate scanned files
+- **Compression Hints**: Dialogs now suggest installing jbig2enc/pngquant when missing — without them, Medium/Maximum optimization barely outperforms Light on scanned books
+- **Aggressive (Lossy) Compression** — both off by default:
+  - Lossy JBIG2 for B/W pages (smallest scans; may alter similar-looking characters)
+  - Downsample images to 200 DPI via Ghostscript (visibly lossy; result is kept only if smaller)
 
 ### v1.6.0
 - **Queue System**: Operations now queue sequentially with "Cancel All" support
