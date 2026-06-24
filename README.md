@@ -1,6 +1,6 @@
 # DJVU to PDF Converter for Zotero
 
-A Zotero 7/8 plugin that converts DJVU files to PDF with optional OCR and compression.
+A Zotero plugin that converts DJVU files to PDF with optional OCR and compression.
 
 <p align="center">
   <img src="screenshots/conversion-dialog.png" alt="Conversion Dialog" width="500">
