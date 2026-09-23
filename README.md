@@ -14,6 +14,7 @@ A Zotero plugin that converts DJVU files to PDF with optional OCR and compressio
 - **OCR Support**: Add searchable text layer to PDFs (supports 12 languages)
 - **PDF Compression**: Reduce file size using ocrmypdf optimization
 - **Cover Removal**: Optionally drop the first page (cover) — scanned covers often account for much of the file size
+- **Black & White Text Pages**: Text-only pages are converted as pure black & white instead of full-colour images — often 10× smaller PDFs
 - **Bookmarks Carried Over**: The DJVU table of contents becomes PDF bookmarks in the converted file
 - **PDF Metadata**: Converted PDFs get title and author from the Zotero item
 - **Flexible Options**: Choose to replace original or keep both files
@@ -114,6 +115,7 @@ Right-click on items in your library to access:
 | Add OCR text layer | Makes the PDF searchable (requires ocrmypdf + tesseract) |
 | OCR Languages | Select one or more languages for OCR |
 | Remove cover (first page) | Skips the cover page; in the Compress PDF dialog this requires qpdf or ghostscript |
+| Page images | **Auto** (default): pages with only text become pure black & white, pages with pictures or colour stay in colour (mixing both requires qpdf). **Colour**: every page as scanned (largest). **Black & white**: all pages (smallest, drops pictures) |
 | Compress PDF | Reduces file size (requires ocrmypdf) |
 | Lossy JBIG2 | Off by default. Much smaller B/W scans, but may substitute similar-looking characters (requires jbig2enc) |
 | Downsample images to 200 DPI | Off by default. Visibly lossy; biggest size reduction for high-resolution scans (requires ghostscript). May slightly reduce OCR accuracy when combined with OCR |
@@ -178,6 +180,11 @@ Make sure the required language pack is installed:
 - **Windows**: Download language packs from [Tesseract GitHub](https://github.com/tesseract-ocr/tessdata)
 
 ## Changelog
+
+### v1.9.0
+- **Much Smaller PDFs**: New "Page images" option in the conversion dialogs. `ddjvu` normally renders every page as a full-colour lossless image, so PDFs came out ~10× larger than the DJVU. In **Auto** mode (default) each page is checked first: pages with only text are converted as pure black & white (compressed to JBIG2 by the compression step), while pages with pictures, grey shapes or colour keep their colour. A 479-page textbook went from 178.7 MB to 19.6 MB
+  - **Colour** keeps the previous behaviour; **Black & white** converts all pages (smallest, drops pictures)
+  - Mixed documents are combined with qpdf; without it the file is converted in colour with a warning
 
 ### v1.8.1
 - **Informative Error Messages**: Failures now say why, per file, in the progress dialog (selectable for copying) instead of a bare "Conversion failed"

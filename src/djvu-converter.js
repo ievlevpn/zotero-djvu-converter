@@ -8,6 +8,14 @@ class ZoteroDJVUConverter {
   static DOWNSAMPLE_COLOR_DPI = 200;     // Color/grayscale images
   static DOWNSAMPLE_MONO_DPI = 300;      // B/W images (kept higher for text legibility)
 
+  // Auto page mode: a page is rendered 1-bit unless its normal and 1-bit
+  // thumbnails disagree or it contains colour. Calibrated on 3050 pages of 7
+  // books: text pages mismatch <= 0.15%, a grey logo 0.47%, covers 11-98%
+  static SCAN_SIZE = 150;                   // Thumbnail bounding box (px)
+  static SCAN_MISMATCH_FRACTION = 0.003;    // Pixels black in 1-bit but light in normal render (or vice versa)
+  static SCAN_CHROMA = 40;                  // Max-min channel spread above this = coloured pixel
+  static SCAN_CHROMA_FRACTION = 0.005;      // Coloured pixels on more than 0.5% of the page
+
   // Polling intervals (in milliseconds)
   static POLL_INTERVAL_FAST = 500;       // For conversion/compression
   static POLL_INTERVAL_SLOW = 1000;      // For OCR (less frequent)
@@ -331,6 +339,27 @@ class ZoteroDJVUConverter {
     if (missing.length > 0) {
       container.appendChild(this.createDisabledNote(doc, `Tip: install ${missing.join(" and ")} for stronger compression`));
     }
+  }
+
+  // Create the page image mode dropdown for DJVU conversion
+  // Returns { container, getValue }
+  createPageModeSection(doc) {
+    const S = ZoteroDJVUConverter.STYLES;
+    const container = this.createSection(doc);
+
+    const label = doc.createElement("div");
+    label.textContent = "Page images:";
+    label.style.cssText = S.LABEL + " margin-bottom: 8px;";
+    container.appendChild(label);
+
+    const select = this.createSelect(doc, [
+      { value: "auto", label: "Auto: black & white for text pages (recommended)" },
+      { value: "color", label: "Colour: every page as scanned (largest)" },
+      { value: "bw", label: "Black & white: all pages (smallest, drops pictures)" }
+    ], "auto");
+    container.appendChild(select);
+
+    return { container, getValue: () => select.value };
   }
 
   // Create the lossy compression options section (both off by default)
@@ -1085,6 +1114,102 @@ class ZoteroDJVUConverter {
       if (/error/i.test(lines[i]) && !/^\s/.test(lines[i])) return lines[i].trim();
     }
     return "";
+  }
+
+  // Parse a binary PGM (P5) or PPM (P6) image as written by ddjvu
+  parsePnm(bytes) {
+    // Header: magic, width, height, maxval as whitespace-separated tokens (with # comments)
+    const tokens = [];
+    let pos = 0;
+    while (tokens.length < 4 && pos < bytes.length) {
+      const c = bytes[pos];
+      if (c === 0x23) { // '#' comment to end of line
+        while (pos < bytes.length && bytes[pos] !== 0x0a) pos++;
+      } else if (c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d) {
+        pos++;
+      } else {
+        let tok = "";
+        while (pos < bytes.length && bytes[pos] > 0x20) tok += String.fromCharCode(bytes[pos++]);
+        tokens.push(tok);
+      }
+    }
+    const [magic, w, h] = tokens;
+    if (magic !== "P5" && magic !== "P6") throw new Error(`Unsupported image format ${magic}`);
+    const channels = magic === "P6" ? 3 : 1;
+    const width = parseInt(w, 10), height = parseInt(h, 10);
+    // A single whitespace byte separates the header from the pixel data
+    return { width, height, channels, pixels: bytes.subarray(pos + 1, pos + 1 + width * height * channels) };
+  }
+
+  // Would rendering this page as 1-bit lose anything? Compares thumbnails of
+  // the normal render (PPM) and the 1-bit text mask render (PGM). Grey ink
+  // turning black is fine; pictures, grey shapes and colour are not.
+  needsColor(full, mask) {
+    const C = ZoteroDJVUConverter;
+    if (full.width !== mask.width || full.height !== mask.height || full.channels !== 3) return true;
+    const n = full.width * full.height;
+    let mismatch = 0, coloured = 0;
+    for (let i = 0; i < n; i++) {
+      const r = full.pixels[3 * i], g = full.pixels[3 * i + 1], b = full.pixels[3 * i + 2];
+      const grey = (r * 299 + g * 587 + b * 114) / 1000;
+      const m = mask.pixels[i];
+      if ((m < 128 && grey > 200) || (m > 200 && grey < 128)) mismatch++;
+      if (Math.max(r, g, b) - Math.min(r, g, b) > C.SCAN_CHROMA) coloured++;
+    }
+    return mismatch > n * C.SCAN_MISMATCH_FRACTION || coloured > n * C.SCAN_CHROMA_FRACTION;
+  }
+
+  // Find the pages that need colour/greyscale rendering. DJVU stores text as a
+  // separate 1-bit mask, so a page without pictures or colour loses nothing when
+  // rendered from the mask alone as pure black & white.
+  // Renders thumbnails of all pages in one ddjvu pass per render mode.
+  // Returns { colorPages: Set of 1-based page numbers, scanned: pages analyzed }.
+  // Pages that could not be analyzed count as colour (the safe choice).
+  async findColorPages(djvuPath, totalPages) {
+    const C = ZoteroDJVUConverter;
+    const scanDir = PathUtils.join(Zotero.getTempDirectory().path, `djvu_conv_scan_${Date.now()}`);
+    const colorPages = new Set();
+    let scanned = 0;
+    try {
+      await IOUtils.makeDirectory(scanDir);
+      const size = `-size=${C.SCAN_SIZE}x${C.SCAN_SIZE}`;
+      const render = (format, mode, name) => Zotero.Utilities.Internal.exec(this.ddjvuPath, [
+        `-format=${format}`, `-mode=${mode}`, size, "-eachpage", djvuPath, PathUtils.join(scanDir, name)
+      ]).catch(e => this.log(`Page scan (${mode}) incomplete: ${e.message}`));
+      await Promise.all([
+        render("ppm", "color", "full_%d.ppm"),
+        render("pgm", "black", "mask_%d.pgm")
+      ]);
+
+      for (let p = 1; p <= totalPages; p++) {
+        try {
+          const full = this.parsePnm(await IOUtils.read(PathUtils.join(scanDir, `full_${p}.ppm`)));
+          const mask = this.parsePnm(await IOUtils.read(PathUtils.join(scanDir, `mask_${p}.pgm`)));
+          if (this.needsColor(full, mask)) colorPages.add(p);
+          scanned++;
+        } catch (e) {
+          colorPages.add(p);
+        }
+      }
+    } catch (e) {
+      this.log(`Page scan failed: ${e.message}`);
+      for (let p = 1; p <= totalPages; p++) colorPages.add(p);
+    } finally {
+      try { await IOUtils.remove(scanDir, { recursive: true }); } catch (e) {}
+    }
+    return { colorPages, scanned };
+  }
+
+  // Compress sorted page numbers into a ddjvu page spec, e.g. [2,3,4,7] -> "2-4,7"
+  formatPageSpec(pages) {
+    const parts = [];
+    for (let i = 0; i < pages.length; i++) {
+      let j = i;
+      while (j + 1 < pages.length && pages[j + 1] === pages[j] + 1) j++;
+      parts.push(i === j ? `${pages[i]}` : `${pages[i]}-${pages[j]}`);
+      i = j;
+    }
+    return parts.join(",");
   }
 
   // Check a DJVU file's IFF header against its size to catch truncated
@@ -2052,7 +2177,7 @@ class ZoteroDJVUConverter {
       options.addOcr = false;
     }
 
-    this.log(`Options: OCR=${options.addOcr}, compressLevel=${options.compressLevel}, deleteOriginal=${options.deleteOriginal}, removeCover=${options.removeCover}`);
+    this.log(`Options: OCR=${options.addOcr}, compressLevel=${options.compressLevel}, deleteOriginal=${options.deleteOriginal}, removeCover=${options.removeCover}, pageMode=${options.pageMode}`);
 
     // Queue or execute the conversion
     await this.enqueueOperation("convert", djvuItems, options);
@@ -2133,6 +2258,10 @@ class ZoteroDJVUConverter {
         doc, "djvu-batch-remove-cover", "Remove cover (first page) from each file", false
       );
       dialog.appendChild(coverLabel);
+
+      // Page image mode (black & white vs colour)
+      const pageModeSection = this.createPageModeSection(doc);
+      dialog.appendChild(pageModeSection.container);
 
       // Show/hide language selector based on OCR checkbox
       const updateLangVisibility = () => {
@@ -2219,6 +2348,7 @@ class ZoteroDJVUConverter {
           compressLevel: compressSelect.value,
           deleteOriginal: replaceRadio.checked,
           removeCover: coverCheckbox.checked,
+          pageMode: pageModeSection.getValue(),
           ...lossySection.getOptions()
         });
       });
@@ -3363,7 +3493,7 @@ class ZoteroDJVUConverter {
       options.addOcr = false;
     }
 
-    this.log(`Auto-convert options: OCR=${options.addOcr}, compressLevel=${options.compressLevel}, deleteOriginal=${options.deleteOriginal}, removeCover=${options.removeCover}`);
+    this.log(`Auto-convert options: OCR=${options.addOcr}, compressLevel=${options.compressLevel}, deleteOriginal=${options.deleteOriginal}, removeCover=${options.removeCover}, pageMode=${options.pageMode}`);
 
     // Mark items as being processed to prevent duplicate handling
     const itemIds = djvuItems.map(item => item.id);
@@ -3458,6 +3588,10 @@ class ZoteroDJVUConverter {
       );
       dialog.appendChild(coverLabel);
 
+      // Page image mode (black & white vs colour)
+      const pageModeSection = this.createPageModeSection(doc);
+      dialog.appendChild(pageModeSection.container);
+
       // Compression dropdown (always visible, independent of OCR)
       const compressContainer = this.createSection(doc);
       const compressAvailable = this.ocrmypdfFound;
@@ -3535,6 +3669,7 @@ class ZoteroDJVUConverter {
           deleteOriginal: replaceRadio.checked,
           ocrLanguages: ocrLangs,
           removeCover: coverCheck.checked,
+          pageMode: pageModeSection.getValue(),
           ...lossySection.getOptions()
         });
       });
@@ -3791,13 +3926,14 @@ class ZoteroDJVUConverter {
     }
 
     // Non-fatal problems to report alongside a successful conversion
-    let warning = null;
+    const warnings = [];
 
     // Step 1: Convert DJVU to PDF
     const tempPdfPath = filePath.replace(/\.(djvu|djv)$/i, ".pdf");
     this.log(`Converting: ${filePath} -> ${tempPdfPath}`);
 
-    const ddjvuResult = await this.runDdjvuWithProgress(filePath, tempPdfPath, progress, getBatchPrefix, options.removeCover);
+    const ddjvuResult = await this.runDdjvuWithProgress(filePath, tempPdfPath, progress, getBatchPrefix, options.removeCover, options.pageMode);
+    if (ddjvuResult.warning) warnings.push(ddjvuResult.warning);
 
     // Get converted PDF size
     let convertedSize = 0;
@@ -3899,7 +4035,7 @@ class ZoteroDJVUConverter {
         }
         // Continue with original PDF on OCR failure
         this.log(`Processing failed for ${filename}: ${ocrError.message}`);
-        warning = `Converted without ${needsOcr ? "OCR" : "compression"}. ${ocrError.message}`;
+        warnings.push(`Converted without ${needsOcr ? "OCR" : "compression"}. ${ocrError.message}`);
         try { await IOUtils.remove(ocrPdfPath); } catch (e) {}
       }
     }
@@ -3940,7 +4076,7 @@ class ZoteroDJVUConverter {
     this.log(`Successfully converted: ${filename}`);
 
     // Return size info for completion message
-    return { originalSize, convertedSize, finalSize, warning };
+    return { originalSize, convertedSize, finalSize, warning: warnings.join(" ") || null };
   }
 
   // Validate attachment is a DJVU file and get its path
@@ -4555,7 +4691,7 @@ class ZoteroDJVUConverter {
     }
   }
 
-  async runDdjvuWithProgress(inputPath, outputPath, progress, getBatchPrefix = () => "", removeCover = false) {
+  async runDdjvuWithProgress(inputPath, outputPath, progress, getBatchPrefix = () => "", removeCover = false, pageMode = "color") {
     if (!inputPath || !outputPath) {
       throw new Error("Missing input or output path");
     }
@@ -4599,28 +4735,94 @@ class ZoteroDJVUConverter {
     try { await IOUtils.remove(outputPath); } catch (e) {}
 
     // Skip the first page (cover) when requested - needs a known page count for the range
-    let pageRange = "";
+    let coverRemoved = false;
+    let firstPage = 1;
     if (removeCover) {
       if (totalPages && totalPages > 1) {
-        pageRange = ` -page=2-${totalPages}`;
+        coverRemoved = true;
+        firstPage = 2;
         this.log("Removing cover: converting pages 2-" + totalPages);
       } else {
         this.log("Cannot remove cover: page count unknown or single page, converting all pages");
       }
     }
+    const pagesToConvert = totalPages ? totalPages - firstPage + 1 : null;
 
-    // Build the ddjvu command with -verbose for progress (cross-platform)
-    // Using temp paths which only contain safe ASCII characters
+    // Decide which pages are rendered 1-bit ("black") and which in colour.
+    // A null page list means "all pages" (no -page option needed).
+    let colorPages = null;
+    let blackPages = [];
+    let warning = null;
+    if (pageMode === "bw") {
+      colorPages = [];
+      blackPages = null;
+    } else if (pageMode === "auto") {
+      if (!totalPages) {
+        warning = "Auto black & white skipped: page count unknown, converted in colour.";
+      } else {
+        progress.updateText(`${getBatchPrefix()}Analyzing pages for black & white conversion...`);
+        const scan = await this.findColorPages(tempInputPath, totalPages);
+        const all = [];
+        for (let p = firstPage; p <= totalPages; p++) all.push(p);
+        colorPages = all.filter(p => scan.colorPages.has(p));
+        blackPages = all.filter(p => !scan.colorPages.has(p));
+        this.log(`Page analysis (${scan.scanned}/${totalPages} scanned): ${blackPages.length} black & white, ${colorPages.length} colour [${this.formatPageSpec(colorPages)}]`);
+        if (scan.scanned === 0) {
+          warning = "Auto black & white skipped: page analysis failed, converted in colour.";
+        }
+        if (colorPages.length > 0 && blackPages.length > 0 && !this.qpdfPath) {
+          // Mixing both kinds of pages needs qpdf to merge them in order
+          warning = "Auto black & white skipped: install qpdf to combine black & white and colour pages.";
+          colorPages = all;
+          blackPages = [];
+        }
+      }
+    }
+    if (progress.cancelled) {
+      try { await IOUtils.remove(tempInputPath); } catch (e) {}
+      throw new Error("Cancelled by user");
+    }
+
+    // Build the ddjvu command(s) with -verbose for progress (cross-platform).
+    // Temp paths only contain safe ASCII characters; Windows gets extra escaping.
+    const win = this.isWindows();
+    const q = (p) => `"${win ? this.escapeWindowsPath(p) : p}"`;
+    const allPagesSpec = firstPage > 1 ? `${firstPage}-${totalPages}` : null;
+    const ddjvuRun = (pages, black, out, append) => {
+      const pageOpt = pages ? ` -page=${this.formatPageSpec(pages)}` : (allPagesSpec ? ` -page=${allPagesSpec}` : "");
+      return `${q(this.ddjvuPath)} -format=pdf${black ? " -mode=black" : ""}${pageOpt} -verbose ${q(tempInputPath)} ${q(out)} 2${append ? ">>" : ">"}${q(logFile)}`;
+    };
+
     let ddjvuCmd;
-    if (this.isWindows()) {
-      const escapedInput = this.escapeWindowsPath(tempInputPath);
-      const escapedOutput = this.escapeWindowsPath(tempOutputPath);
-      const escapedTool = this.escapeWindowsPath(this.ddjvuPath);
-      const escapedLog = this.escapeWindowsPath(logFile);
-      ddjvuCmd = `"${escapedTool}" -format=pdf${pageRange} -verbose "${escapedInput}" "${escapedOutput}" 2>"${escapedLog}"`;
+    const colorPath = PathUtils.join(tempDir, `${tempId}_color.pdf`);
+    const blackPath = PathUtils.join(tempDir, `${tempId}_black.pdf`);
+    if (colorPages === null || blackPages === null || colorPages.length === 0 || blackPages.length === 0) {
+      // Single pass: every page rendered the same way
+      const black = blackPages === null || (colorPages !== null && colorPages.length === 0);
+      ddjvuCmd = ddjvuRun(null, black, tempOutputPath, false);
     } else {
-      // Temp paths are safe ASCII, no escaping needed but we still quote them
-      ddjvuCmd = `export LANG=en_US.UTF-8; "${this.ddjvuPath}" -format=pdf${pageRange} -verbose "${tempInputPath}" "${tempOutputPath}" 2>"${logFile}"`;
+      // Mixed: render each kind in one pass, then interleave the pages in
+      // document order with qpdf (copies page content without re-encoding)
+      const selection = [];
+      let ci = 0, bi = 0;
+      for (let p = firstPage; p <= totalPages; p++) {
+        const fromColor = colorPages[ci] === p;
+        const file = fromColor ? colorPath : blackPath;
+        const index = fromColor ? ++ci : ++bi;
+        const last = selection[selection.length - 1];
+        if (last && last.file === file && last.to === index - 1) {
+          last.to = index;
+        } else {
+          selection.push({ file, from: index, to: index });
+        }
+      }
+      const pagesArg = selection.map(s => `${q(s.file)} ${s.from === s.to ? s.from : `${s.from}-${s.to}`}`).join(" ");
+      ddjvuCmd = `${ddjvuRun(colorPages, false, colorPath, false)} && ` +
+        `${ddjvuRun(blackPages, true, blackPath, true)} && ` +
+        `${q(this.qpdfPath)} --warning-exit-0 --empty --pages ${pagesArg} -- ${q(tempOutputPath)} 2>>${q(logFile)}`;
+    }
+    if (!win) {
+      ddjvuCmd = `export LANG=en_US.UTF-8; ${ddjvuCmd}`;
     }
 
     // Start background process using helper
@@ -4631,6 +4833,8 @@ class ZoteroDJVUConverter {
     const cleanupTempFiles = async () => {
       try { await IOUtils.remove(tempInputPath); } catch (e) {}
       try { await IOUtils.remove(tempOutputPath); } catch (e) {}
+      try { await IOUtils.remove(colorPath); } catch (e) {}
+      try { await IOUtils.remove(blackPath); } catch (e) {}
       try { await IOUtils.remove(markerFile); } catch (e) {}
       try { await IOUtils.remove(errorFile); } catch (e) {}
       try { await IOUtils.remove(logFile); } catch (e) {}
@@ -4660,11 +4864,12 @@ class ZoteroDJVUConverter {
           let pageInfo = "";
           try {
             const logContent = await Zotero.File.getContentsAsync(logFile);
+            // Count pages started (page numbers jump when colour and
+            // black & white pages are rendered in separate passes)
             const pageMatches = logContent.match(/-------- page (\d+) -------/g);
             if (pageMatches && pageMatches.length > 0) {
-              const lastMatch = pageMatches[pageMatches.length - 1];
-              const currentPage = lastMatch.match(/page (\d+)/)[1];
-              pageInfo = totalPages ? ` • page ${currentPage}/${totalPages}` : ` • page ${currentPage}`;
+              const done = pageMatches.length;
+              pageInfo = pagesToConvert ? ` • page ${done}/${pagesToConvert}` : ` • page ${done}`;
             }
           } catch (e) {
             // Log file might not exist yet
@@ -4695,8 +4900,9 @@ class ZoteroDJVUConverter {
             this.log("DJVU conversion complete");
             resolve({
               outline,
-              coverRemoved: pageRange !== "",
-              pageCount: totalPages
+              coverRemoved,
+              pageCount: totalPages,
+              warning
             });
           } else if (error) {
             clearInterval(checkInterval);
