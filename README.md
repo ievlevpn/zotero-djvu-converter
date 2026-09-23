@@ -179,6 +179,14 @@ Make sure the required language pack is installed:
 
 ## Changelog
 
+### v1.8.1
+- **Informative Error Messages**: Failures now say why, per file, in the progress dialog (selectable for copying) instead of a bare "Conversion failed"
+  - Truncated DJVU downloads and non-DJVU files are detected up front ("DJVU file is incomplete: 8.0 MB of 21.3 MB")
+  - ddjvu errors are shown verbatim with the exit code (e.g. "Cannot decode page 190")
+  - ocrmypdf failures explain the exit code and the key log line (e.g. missing tesseract language data)
+  - OCR/compression failing during conversion is reported as a warning rather than silently skipped
+  - Missing attachment files are reported instead of counted as failed without a reason
+
 ### v1.8.0
 - **Table of Contents Preserved**: The DJVU navigation outline (chapters/sections, any language) is carried over as PDF bookmarks during conversion — `ddjvu` normally drops it. Bookmark targets are adjusted when the cover page is removed
 - **PDF Metadata from Zotero**: Converted PDFs get Title and Author from the attachment's parent item, so files carry proper metadata outside Zotero

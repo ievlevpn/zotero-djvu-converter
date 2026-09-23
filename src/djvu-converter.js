@@ -80,6 +80,23 @@ class ZoteroDJVUConverter {
     MESSAGE: "margin-bottom: 20px; color: #666;",
     STATUS_TEXT: "margin-bottom: 8px; color: #666; min-height: 18px; font-size: 13px;",
     QUEUE_INFO: "margin-bottom: 12px; color: #888; font-size: 12px; display: none;",
+    ISSUE_DETAILS: `
+      display: none;
+      max-width: 420px;
+      max-height: 180px;
+      overflow-y: auto;
+      margin-bottom: 12px;
+      padding: 6px 8px;
+      background: #f7f7f7;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      font-size: 12px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      user-select: text;
+      -moz-user-select: text;
+      cursor: text;
+    `,
     NOTE_DISABLED: "font-size: 11px; color: #999; margin-top: 4px;",
     BUTTON_BASE: `
       padding: 8px 16px;
@@ -546,6 +563,8 @@ class ZoteroDJVUConverter {
     let totalOriginalSize = 0;
     let totalConvertedSize = 0;
     let totalFinalSize = 0;
+    // Per-file problems shown in the progress dialog
+    const issues = [];
 
     // Helper to get current total (dynamic - updates as queue changes)
     const getTotal = () => globalOffset + this.getTotalFilesInQueue();
@@ -566,8 +585,9 @@ class ZoteroDJVUConverter {
         }
 
         try {
-          const filePath = await this.validateDjvuAttachment(item);
+          const { filePath, error } = await this.checkDjvuAttachment(item);
           if (!filePath) {
+            issues.push(this.describeIssue(item, null, error));
             failCount++;
             continue;
           }
@@ -589,12 +609,16 @@ class ZoteroDJVUConverter {
             totalOriginalSize += sizeInfo.originalSize || 0;
             totalConvertedSize += sizeInfo.convertedSize || 0;
             totalFinalSize += sizeInfo.finalSize || 0;
+            if (sizeInfo.warning) {
+              issues.push(this.describeIssue(item, filePath, sizeInfo.warning, true));
+            }
           }
         } catch (e) {
           this.log(`Error converting file ${globalFileNum}: ${e.message}`);
           if (e.message.includes("Cancelled by user") || progress.cancelled) {
             break;
           }
+          issues.push(this.describeIssue(item, null, e.message));
           failCount++;
         }
       }
@@ -613,9 +637,9 @@ class ZoteroDJVUConverter {
               const { originalSize, convertedSize, finalSize } = lastSizeInfo;
               sizeStr = ` ${this.formatSize(originalSize)} → ${this.formatSize(convertedSize)} → ${this.formatSize(finalSize)}`;
             }
-            progress.finish(true, "Done!" + sizeStr);
+            progress.finish(true, "Done!" + sizeStr, issues);
           } else {
-            progress.finish(false, "Conversion failed");
+            progress.finish(false, "Conversion failed", issues);
           }
         } else {
           const totalSuccess = globalOffset + successCount;
@@ -627,9 +651,9 @@ class ZoteroDJVUConverter {
           if (progress.cancelled) {
             progress.finish(false, `Cancelled after ${totalSuccess}/${finalTotal}`);
           } else if (failCount === 0) {
-            progress.finish(true, `All ${finalTotal} files converted` + sizeStr);
+            progress.finish(true, `All ${finalTotal} files converted` + sizeStr, issues);
           } else {
-            progress.finish(false, `Done: ${successCount} converted, ${failCount} failed`);
+            progress.finish(false, `Done: ${successCount} converted, ${failCount} failed`, issues);
           }
         }
       }
@@ -651,6 +675,8 @@ class ZoteroDJVUConverter {
     let lastSizeInfo = null;
     let totalInputSize = 0;
     let totalOutputSize = 0;
+    // Per-file problems shown in the progress dialog
+    const issues = [];
 
     // Helper to get current total (dynamic - updates as queue changes)
     const getTotal = () => globalOffset + this.getTotalFilesInQueue();
@@ -673,6 +699,7 @@ class ZoteroDJVUConverter {
         try {
           const filePath = await item.getFilePathAsync();
           if (!filePath) {
+            issues.push(this.describeIssue(item, null, "Attachment file not found on disk (not downloaded yet, moved, or a linked file that no longer exists)"));
             failCount++;
             continue;
           }
@@ -699,6 +726,7 @@ class ZoteroDJVUConverter {
           if (e.message.includes("Cancelled by user") || progress.cancelled) {
             break;
           }
+          issues.push(this.describeIssue(item, null, e.message));
           failCount++;
         }
       }
@@ -718,7 +746,7 @@ class ZoteroDJVUConverter {
             }
             progress.finish(true, "Done!" + sizeStr);
           } else {
-            progress.finish(false, "OCR failed");
+            progress.finish(false, "OCR failed", issues);
           }
         } else {
           const totalSuccess = globalOffset + successCount;
@@ -731,7 +759,7 @@ class ZoteroDJVUConverter {
             }
             progress.finish(true, `OCR added to all ${finalTotal} files` + sizeStr);
           } else {
-            progress.finish(false, `Done: ${successCount} processed, ${failCount} failed`);
+            progress.finish(false, `Done: ${successCount} processed, ${failCount} failed`, issues);
           }
         }
       }
@@ -753,6 +781,8 @@ class ZoteroDJVUConverter {
     let lastSizeInfo = null;
     let totalInputSize = 0;
     let totalOutputSize = 0;
+    // Per-file problems shown in the progress dialog
+    const issues = [];
 
     // Helper to get current total (dynamic - updates as queue changes)
     const getTotal = () => globalOffset + this.getTotalFilesInQueue();
@@ -775,6 +805,7 @@ class ZoteroDJVUConverter {
         try {
           const filePath = await item.getFilePathAsync();
           if (!filePath) {
+            issues.push(this.describeIssue(item, null, "Attachment file not found on disk (not downloaded yet, moved, or a linked file that no longer exists)"));
             failCount++;
             continue;
           }
@@ -801,6 +832,7 @@ class ZoteroDJVUConverter {
           if (e.message.includes("Cancelled by user") || progress.cancelled) {
             break;
           }
+          issues.push(this.describeIssue(item, null, e.message));
           failCount++;
         }
       }
@@ -824,7 +856,7 @@ class ZoteroDJVUConverter {
             }
             progress.finish(true, "Done!" + sizeStr);
           } else {
-            progress.finish(false, "Compression failed");
+            progress.finish(false, "Compression failed", issues);
           }
         } else {
           const totalSuccess = globalOffset + successCount;
@@ -837,7 +869,7 @@ class ZoteroDJVUConverter {
             }
             progress.finish(true, `All ${finalTotal} files compressed` + sizeStr);
           } else {
-            progress.finish(false, `Done: ${successCount} compressed, ${failCount} failed`);
+            progress.finish(false, `Done: ${successCount} compressed, ${failCount} failed`, issues);
           }
         }
       }
@@ -952,6 +984,23 @@ class ZoteroDJVUConverter {
     return pkgList.join(", ");
   }
 
+  // Build a per-file problem entry for the progress dialog
+  describeIssue(item, filePath, message, isWarning = false) {
+    let name = "";
+    try { name = item.getField("title"); } catch (e) {}
+    name = this.truncateFilename(name || this.getBasename(filePath || "") || "file", 50);
+    return { name, message, isWarning };
+  }
+
+  // Format issues as plain text; the file name is omitted for a single failure
+  // since the dialog is already about that file
+  formatIssues(issues) {
+    return issues.map(({ name, message, isWarning }) => {
+      const prefix = isWarning ? "⚠ " : "✗ ";
+      return issues.length === 1 && !isWarning ? message : `${prefix}${name}: ${message}`;
+    }).join("\n\n");
+  }
+
   // Format file size for display
   formatSize(bytes) {
     // Handle edge cases
@@ -977,8 +1026,88 @@ class ZoteroDJVUConverter {
       const escapedMarker = this.escapeShellPath(markerFile);
       const escapedError = this.escapeShellPath(errorFile);
       const escapedPid = this.escapeShellPath(pidFile);
-      return `(${cmd} && touch "${escapedMarker}") || (touch "${escapedError}") & echo $! > "${escapedPid}"`;
+      // The error file records the exit code so failures can be explained
+      return `(${cmd} && touch "${escapedMarker}") || (echo $? > "${escapedError}") & echo $! > "${escapedPid}"`;
     }
+  }
+
+  // Read the exit code recorded in an error marker file (Unix only), or null
+  async readExitCode(errorFile) {
+    try {
+      const code = parseInt((await Zotero.File.getContentsAsync(errorFile)).trim(), 10);
+      return isNaN(code) ? null : code;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // ocrmypdf exit codes (https://ocrmypdf.readthedocs.io/en/latest/advanced.html#return-code-policy)
+  static OCRMYPDF_EXIT_CODES = {
+    1: "invalid arguments",
+    2: "input is not a valid PDF",
+    3: "a required program or language pack is missing",
+    4: "output PDF is invalid",
+    5: "could not read input or write output (file access)",
+    6: "PDF already has text (use force OCR to redo it)",
+    7: "a helper program (tesseract/ghostscript) failed",
+    8: "PDF is encrypted/password-protected",
+    9: "invalid tesseract configuration",
+    10: "PDF/A conversion failed",
+    15: "unexpected internal error",
+    130: "interrupted"
+  };
+
+  // Pick the most informative line(s) out of an ocrmypdf stderr log
+  extractOcrmypdfError(logContent) {
+    if (!logContent) return "";
+    const lines = logContent.split("\n").map(l => l.trimEnd());
+
+    // Missing tesseract language data - the language codes follow on the next lines
+    const langIdx = lines.findIndex(l => l.includes("does not have language data"));
+    if (langIdx >= 0) {
+      const langs = [];
+      for (let i = langIdx + 1; i < lines.length && lines[i].trim() && !lines[i].startsWith("Please"); i++) {
+        langs.push(lines[i].trim());
+      }
+      return `tesseract language data not installed: ${langs.join(", ") || "unknown"}`;
+    }
+
+    // Python exception at the end of a traceback, e.g. "ocrmypdf.exceptions.EncryptedPdfError: ..."
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const m = lines[i].match(/^[\w.]*?(\w+(?:Error|Exception))(?::\s*(.*))?$/);
+      if (m && m[1] !== "ExitCodeException") {
+        return m[2] ? `${m[1]}: ${m[2]}` : m[1];
+      }
+    }
+
+    // Otherwise the last unindented line mentioning an error
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (/error/i.test(lines[i]) && !/^\s/.test(lines[i])) return lines[i].trim();
+    }
+    return "";
+  }
+
+  // Check a DJVU file's IFF header against its size to catch truncated
+  // downloads and non-DJVU files. Returns an error message, or null if OK.
+  async checkDjvuFile(filePath) {
+    let header, size;
+    try {
+      header = await IOUtils.read(filePath, { maxBytes: 12 });
+      size = (await IOUtils.stat(filePath)).size;
+    } catch (e) {
+      return `Cannot read file: ${e.message}`;
+    }
+    const magic = String.fromCharCode(...header.slice(0, 8));
+    if (magic !== "AT&TFORM") {
+      return "Not a valid DJVU file (the file header is wrong - it may be an HTML page or another format saved as .djvu)";
+    }
+    // FORM chunk length (big-endian) + 12 header bytes = expected file size
+    const expected = ((header[8] << 24) >>> 0) + (header[9] << 16) + (header[10] << 8) + header[11] + 12;
+    if (size < expected) {
+      return `DJVU file is incomplete: ${this.formatSize(size)} of ${this.formatSize(expected)} ` +
+        `(${Math.round(100 * size / expected)}%). It was probably an interrupted download - re-download it.`;
+    }
+    return null;
   }
 
   // Start a background process
@@ -3442,7 +3571,7 @@ class ZoteroDJVUConverter {
         cancelled: false,
         updateText: (text) => progress.setText(text),
         setProgress: (percent) => progress.setProgress(percent),
-        finish: (success, msg) => {
+        finish: (success, msg, issues = []) => {
           if (success) {
             progress.setProgress(100);
             progress.setText(msg || "Done!");
@@ -3450,7 +3579,12 @@ class ZoteroDJVUConverter {
             progress.setError();
             progress.setText(msg || "Failed");
           }
-          progressWin.startCloseTimer(ZoteroDJVUConverter.PROGRESS_CLOSE_DELAY);
+          if (issues.length > 0) {
+            // Keep the window open so the reasons can be read
+            progressWin.addDescription(this.formatIssues(issues));
+          } else {
+            progressWin.startCloseTimer(ZoteroDJVUConverter.PROGRESS_CLOSE_DELAY);
+          }
         },
         close: () => progressWin.close()
       };
@@ -3486,6 +3620,12 @@ class ZoteroDJVUConverter {
     queueInfo.id = "djvu-queue-info";
     queueInfo.style.cssText = S.QUEUE_INFO;
     dialog.appendChild(queueInfo);
+
+    // Failure/warning reasons, filled in by finish() (selectable for copying)
+    const issueDetails = doc.createElement("div");
+    issueDetails.id = "djvu-issue-details";
+    issueDetails.style.cssText = S.ISSUE_DETAILS;
+    dialog.appendChild(issueDetails);
 
     // Update queue display initially
     if (this._operationQueue.length > 0) {
@@ -3534,7 +3674,7 @@ class ZoteroDJVUConverter {
         }
       },
       setProgress: (percent) => {}, // No-op for backward compatibility
-      finish: (success, msg) => {
+      finish: (success, msg, issues = []) => {
         if (controller.finished || !dialog.parentNode) return;
         controller.finished = true;
 
@@ -3546,6 +3686,12 @@ class ZoteroDJVUConverter {
 
         statusText.textContent = msg || (success ? "Done!" : "Failed");
         statusText.style.color = success ? "#00aa00" : "#cc0000";
+
+        if (issues.length > 0) {
+          issueDetails.textContent = this.formatIssues(issues);
+          issueDetails.style.color = issues.every(i => i.isWarning) ? "#8a5a00" : "#a00000";
+          issueDetails.style.display = "block";
+        }
 
         // Hide queue info and Cancel All button
         queueInfo.style.display = "none";
@@ -3638,6 +3784,15 @@ class ZoteroDJVUConverter {
       originalSize = stat.size;
     } catch (e) {}
 
+    // Catch truncated downloads / non-DJVU files up front with a clear reason
+    const fileProblem = await this.checkDjvuFile(filePath);
+    if (fileProblem) {
+      throw new Error(fileProblem);
+    }
+
+    // Non-fatal problems to report alongside a successful conversion
+    let warning = null;
+
     // Step 1: Convert DJVU to PDF
     const tempPdfPath = filePath.replace(/\.(djvu|djv)$/i, ".pdf");
     this.log(`Converting: ${filePath} -> ${tempPdfPath}`);
@@ -3660,7 +3815,7 @@ class ZoteroDJVUConverter {
     }
 
     if (!outputExists) {
-      throw new Error(`DJVU to PDF conversion failed for ${filename}`);
+      throw new Error("ddjvu finished but the PDF was not created");
     }
 
     // Check if cancelled
@@ -3744,6 +3899,7 @@ class ZoteroDJVUConverter {
         }
         // Continue with original PDF on OCR failure
         this.log(`Processing failed for ${filename}: ${ocrError.message}`);
+        warning = `Converted without ${needsOcr ? "OCR" : "compression"}. ${ocrError.message}`;
         try { await IOUtils.remove(ocrPdfPath); } catch (e) {}
       }
     }
@@ -3784,40 +3940,40 @@ class ZoteroDJVUConverter {
     this.log(`Successfully converted: ${filename}`);
 
     // Return size info for completion message
-    return { originalSize, convertedSize, finalSize };
+    return { originalSize, convertedSize, finalSize, warning };
   }
 
   // Validate attachment is a DJVU file and get its path
   async validateDjvuAttachment(item) {
-    if (!item) {
-      this.log("No item provided");
-      return null;
-    }
-    if (item.deleted) {
-      this.log("Item is in trash, skipping");
-      return null;
-    }
+    return (await this.checkDjvuAttachment(item)).filePath;
+  }
+
+  // Returns { filePath } for a usable DJVU attachment, or { filePath: null, error }
+  async checkDjvuAttachment(item) {
+    const fail = (error) => {
+      this.log(error);
+      return { filePath: null, error };
+    };
+    if (!item) return fail("No item provided");
+    if (item.deleted) return fail("Item is in the trash");
 
     let filePath;
     try {
       filePath = await item.getFilePathAsync();
     } catch (e) {
-      this.log(`Could not get file path: ${e.message}`);
-      return null;
+      return fail(`Could not get file path: ${e.message}`);
     }
 
     if (!filePath) {
-      this.log("No file path for attachment");
-      return null;
+      return fail("Attachment file not found on disk (not downloaded yet, moved, or a linked file that no longer exists)");
     }
 
     const lowerPath = filePath.toLowerCase();
     if (!lowerPath.endsWith(".djvu") && !lowerPath.endsWith(".djv")) {
-      this.log("Not a DJVU file, skipping");
-      return null;
+      return fail(`Not a DJVU file: ${this.getBasename(filePath)}`);
     }
 
-    return filePath;
+    return { filePath };
   }
 
   async replaceAttachment(item, pdfPath) {
@@ -4083,14 +4239,16 @@ class ZoteroDJVUConverter {
             clearInterval(checkInterval);
             this._activeProcesses.delete(pidFile);
             const modeLabel = skipOcr ? "Compression" : "OCR";
-            let errorMsg = `${modeLabel} processing failed`;
+            const exitCode = await this.readExitCode(errorFile);
+            let detail = "";
             try {
-              const logContent = await Zotero.File.getContentsAsync(errorLogFile);
-              if (logContent && logContent.trim()) {
-                const lines = logContent.trim().split("\n");
-                errorMsg = lines.slice(-3).join(" ").substring(0, 200);
-              }
+              detail = this.extractOcrmypdfError(await Zotero.File.getContentsAsync(errorLogFile));
             } catch (e) {}
+            const codeDesc = ZoteroDJVUConverter.OCRMYPDF_EXIT_CODES[exitCode];
+            let errorMsg = `${modeLabel} failed`;
+            if (codeDesc) errorMsg += `: ${codeDesc}`;
+            if (exitCode !== null) errorMsg += ` (ocrmypdf exit ${exitCode})`;
+            if (detail) errorMsg += ` - ${detail.substring(0, 200)}`;
             await cleanupTempFiles();
             this.log(`${modeLabel} failed: ${errorMsg}`);
             reject(new Error(errorMsg));
@@ -4543,16 +4701,26 @@ class ZoteroDJVUConverter {
           } else if (error) {
             clearInterval(checkInterval);
             this._activeProcesses.delete(pidFile);
-            // Log file contents for debugging before cleanup
+            const exitCode = await this.readExitCode(errorFile);
+            // ddjvu reports errors as "ddjvu: <message>" lines amid its verbose output
+            let ddjvuErrors = [];
             try {
               const logContent = await Zotero.File.getContentsAsync(logFile);
               this.log(`DJVU log file content (last 500 chars): ${logContent ? logContent.slice(-500) : 'empty'}`);
+              ddjvuErrors = [...new Set((logContent || "").split("\n")
+                .filter(l => l.startsWith("ddjvu:"))
+                .map(l => l.slice(6).trim()))];
             } catch (e) {
               this.log(`Could not read log file: ${e.message}`);
             }
             await cleanupTempFiles();
             this.log("DJVU conversion failed");
-            reject(new Error("DJVU conversion failed - check if file is corrupted"));
+            let errorMsg = "ddjvu failed";
+            if (exitCode !== null) errorMsg += ` (exit ${exitCode})`;
+            errorMsg += ddjvuErrors.length > 0
+              ? `: ${ddjvuErrors.slice(-3).join(" ")}`
+              : " with no error output - the file may be damaged";
+            reject(new Error(errorMsg));
           } else if (elapsed >= maxWait) {
             clearInterval(checkInterval);
             await this.killBackgroundProcess(pidFile, "ddjvu");
