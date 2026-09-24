@@ -441,8 +441,9 @@ class ZoteroDJVUConverter {
         this.log(`Queued ${type} operation (${items.length} items). Queue size: ${this._operationQueue.length}`);
         this.updateQueueDisplay();
       } else {
-        // Nothing running, reset offset and start immediately
+        // Nothing running, reset offset and results and start immediately
         this._globalFileOffset = 0;
+        this._queueSession = null;
         this.runOperation(operation);
       }
     });
@@ -568,6 +569,40 @@ class ZoteroDJVUConverter {
     };
   }
 
+  // Per-type results for the current queue run (created on first use).
+  // sizes: convert = [original, converted, final]; ocr/compress = [input, output]
+  getQueueStats(type) {
+    if (!this._queueSession) this._queueSession = { issues: [], byType: {} };
+    const byType = this._queueSession.byType;
+    if (!byType[type]) byType[type] = { success: 0, fail: 0, lastSizeInfo: null, sizes: [0, 0, 0] };
+    return byType[type];
+  }
+
+  getQueueSuccessCount() {
+    return Object.values(this._queueSession?.byType || {}).reduce((n, t) => n + t.success, 0);
+  }
+
+  // True when the queue ran different operation types (e.g. convert, then OCR)
+  isMixedQueueSession() {
+    return Object.keys(this._queueSession?.byType || {}).length > 1;
+  }
+
+  // Summary for a queue run that mixed operation types - per-type wording
+  // ("converted", "OCR added") and size totals would be misleading
+  finishMixedSummary(progress, finalTotal) {
+    const types = Object.values(this._queueSession.byType);
+    const success = types.reduce((n, t) => n + t.success, 0);
+    const fail = types.reduce((n, t) => n + t.fail, 0);
+    const issues = this._queueSession.issues;
+    if (progress.cancelled) {
+      progress.finish(false, `Cancelled after ${success}/${finalTotal}`);
+    } else if (fail === 0) {
+      progress.finish(true, `All ${finalTotal} files processed`, issues);
+    } else {
+      progress.finish(false, `Done: ${success} succeeded, ${fail} failed`, issues);
+    }
+  }
+
   // Get total file count across current operation and queue
   getTotalFilesInQueue() {
     let total = 0;
@@ -586,14 +621,10 @@ class ZoteroDJVUConverter {
     this.log(`Executing conversion for ${fileCount} file(s)`);
     this._isProcessing = true;
     let progress = null;
-    let successCount = 0;
-    let failCount = 0;
-    let lastSizeInfo = null;
-    let totalOriginalSize = 0;
-    let totalConvertedSize = 0;
-    let totalFinalSize = 0;
-    // Per-file problems shown in the progress dialog
-    const issues = [];
+    // Results accumulate across all queued operations so the final summary
+    // covers every file, not just the last operation
+    const stats = this.getQueueStats("convert");
+    const issues = this._queueSession.issues;
 
     // Helper to get current total (dynamic - updates as queue changes)
     const getTotal = () => globalOffset + this.getTotalFilesInQueue();
@@ -617,7 +648,7 @@ class ZoteroDJVUConverter {
           const { filePath, error } = await this.checkDjvuAttachment(item);
           if (!filePath) {
             issues.push(this.describeIssue(item, null, error));
-            failCount++;
+            stats.fail++;
             continue;
           }
 
@@ -631,13 +662,13 @@ class ZoteroDJVUConverter {
           progress.updateText(`${getBatchPrefix()}Converting: ${filename}`);
 
           const sizeInfo = await this.convertSingleDjvu(item, filePath, options, progress, globalFileNum, getBatchPrefix);
-          successCount++;
+          stats.success++;
           // Accumulate sizes for completion message
           if (sizeInfo) {
-            lastSizeInfo = sizeInfo;
-            totalOriginalSize += sizeInfo.originalSize || 0;
-            totalConvertedSize += sizeInfo.convertedSize || 0;
-            totalFinalSize += sizeInfo.finalSize || 0;
+            stats.lastSizeInfo = sizeInfo;
+            stats.sizes[0] += sizeInfo.originalSize || 0;
+            stats.sizes[1] += sizeInfo.convertedSize || 0;
+            stats.sizes[2] += sizeInfo.finalSize || 0;
             if (sizeInfo.warning) {
               issues.push(this.describeIssue(item, filePath, sizeInfo.warning, true));
             }
@@ -648,7 +679,7 @@ class ZoteroDJVUConverter {
             break;
           }
           issues.push(this.describeIssue(item, null, e.message));
-          failCount++;
+          stats.fail++;
         }
       }
 
@@ -656,14 +687,16 @@ class ZoteroDJVUConverter {
       const hasMoreQueued = this._operationQueue.length > 0;
       if (!hasMoreQueued) {
         const finalTotal = getTotal();
-        if (finalTotal === 1) {
+        if (this.isMixedQueueSession()) {
+          this.finishMixedSummary(progress, finalTotal);
+        } else if (finalTotal === 1) {
           if (progress.cancelled) {
             progress.finish(false, "Conversion cancelled");
-          } else if (successCount === 1) {
+          } else if (stats.success === 1) {
             // Build size info string: original → converted → final
             let sizeStr = "";
-            if (lastSizeInfo && lastSizeInfo.originalSize && lastSizeInfo.finalSize) {
-              const { originalSize, convertedSize, finalSize } = lastSizeInfo;
+            if (stats.lastSizeInfo && stats.lastSizeInfo.originalSize && stats.lastSizeInfo.finalSize) {
+              const { originalSize, convertedSize, finalSize } = stats.lastSizeInfo;
               sizeStr = ` ${this.formatSize(originalSize)} → ${this.formatSize(convertedSize)} → ${this.formatSize(finalSize)}`;
             }
             progress.finish(true, "Done!" + sizeStr, issues);
@@ -671,23 +704,23 @@ class ZoteroDJVUConverter {
             progress.finish(false, "Conversion failed", issues);
           }
         } else {
-          const totalSuccess = globalOffset + successCount;
+          const totalSuccess = this.getQueueSuccessCount();
           // Build total size info string
           let sizeStr = "";
-          if (totalOriginalSize && totalFinalSize) {
-            sizeStr = ` • ${this.formatSize(totalOriginalSize)} → ${this.formatSize(totalConvertedSize)} → ${this.formatSize(totalFinalSize)}`;
+          if (stats.sizes[0] && stats.sizes[2]) {
+            sizeStr = ` • ${this.formatSize(stats.sizes[0])} → ${this.formatSize(stats.sizes[1])} → ${this.formatSize(stats.sizes[2])}`;
           }
           if (progress.cancelled) {
             progress.finish(false, `Cancelled after ${totalSuccess}/${finalTotal}`);
-          } else if (failCount === 0) {
+          } else if (stats.fail === 0) {
             progress.finish(true, `All ${finalTotal} files converted` + sizeStr, issues);
           } else {
-            progress.finish(false, `Done: ${successCount} converted, ${failCount} failed`, issues);
+            progress.finish(false, `Done: ${stats.success} converted, ${stats.fail} failed`, issues);
           }
         }
       }
 
-      return { successCount, failCount };
+      return { successCount: stats.success, failCount: stats.fail };
     } finally {
       this._isProcessing = false;
     }
@@ -699,13 +732,10 @@ class ZoteroDJVUConverter {
     this.log(`Executing OCR for ${fileCount} file(s)`);
     this._isProcessing = true;
     let progress = null;
-    let successCount = 0;
-    let failCount = 0;
-    let lastSizeInfo = null;
-    let totalInputSize = 0;
-    let totalOutputSize = 0;
-    // Per-file problems shown in the progress dialog
-    const issues = [];
+    // Results accumulate across all queued operations so the final summary
+    // covers every file, not just the last operation
+    const stats = this.getQueueStats("ocr");
+    const issues = this._queueSession.issues;
 
     // Helper to get current total (dynamic - updates as queue changes)
     const getTotal = () => globalOffset + this.getTotalFilesInQueue();
@@ -729,7 +759,7 @@ class ZoteroDJVUConverter {
           const filePath = await item.getFilePathAsync();
           if (!filePath) {
             issues.push(this.describeIssue(item, null, "Attachment file not found on disk (not downloaded yet, moved, or a linked file that no longer exists)"));
-            failCount++;
+            stats.fail++;
             continue;
           }
 
@@ -743,12 +773,12 @@ class ZoteroDJVUConverter {
           progress.updateText(`${getBatchPrefix()}OCR: ${filename}`);
 
           const sizeInfo = await this.ocrSinglePdf(item, filePath, options, progress, globalFileNum, getBatchPrefix);
-          successCount++;
+          stats.success++;
           // Accumulate sizes for completion message
           if (sizeInfo) {
-            lastSizeInfo = sizeInfo;
-            totalInputSize += sizeInfo.inputSize || 0;
-            totalOutputSize += sizeInfo.outputSize || 0;
+            stats.lastSizeInfo = sizeInfo;
+            stats.sizes[0] += sizeInfo.inputSize || 0;
+            stats.sizes[1] += sizeInfo.outputSize || 0;
           }
         } catch (e) {
           this.log(`Error adding OCR to file ${globalFileNum}: ${e.message}`);
@@ -756,7 +786,7 @@ class ZoteroDJVUConverter {
             break;
           }
           issues.push(this.describeIssue(item, null, e.message));
-          failCount++;
+          stats.fail++;
         }
       }
 
@@ -764,36 +794,38 @@ class ZoteroDJVUConverter {
       const hasMoreQueued = this._operationQueue.length > 0;
       if (!hasMoreQueued) {
         const finalTotal = getTotal();
-        if (finalTotal === 1) {
+        if (this.isMixedQueueSession()) {
+          this.finishMixedSummary(progress, finalTotal);
+        } else if (finalTotal === 1) {
           if (progress.cancelled) {
             progress.finish(false, "OCR cancelled");
-          } else if (successCount === 1) {
+          } else if (stats.success === 1) {
             // Build size info string: input → output
             let sizeStr = "";
-            if (lastSizeInfo && lastSizeInfo.inputSize && lastSizeInfo.outputSize) {
-              sizeStr = ` ${this.formatSize(lastSizeInfo.inputSize)} → ${this.formatSize(lastSizeInfo.outputSize)}`;
+            if (stats.lastSizeInfo && stats.lastSizeInfo.inputSize && stats.lastSizeInfo.outputSize) {
+              sizeStr = ` ${this.formatSize(stats.lastSizeInfo.inputSize)} → ${this.formatSize(stats.lastSizeInfo.outputSize)}`;
             }
-            progress.finish(true, "Done!" + sizeStr);
+            progress.finish(true, "Done!" + sizeStr, issues);
           } else {
             progress.finish(false, "OCR failed", issues);
           }
         } else {
-          const totalSuccess = globalOffset + successCount;
+          const totalSuccess = this.getQueueSuccessCount();
           if (progress.cancelled) {
             progress.finish(false, `Cancelled after ${totalSuccess}/${finalTotal}`);
-          } else if (failCount === 0) {
+          } else if (stats.fail === 0) {
             let sizeStr = "";
-            if (totalInputSize && totalOutputSize) {
-              sizeStr = ` • ${this.formatSize(totalInputSize)} → ${this.formatSize(totalOutputSize)}`;
+            if (stats.sizes[0] && stats.sizes[1]) {
+              sizeStr = ` • ${this.formatSize(stats.sizes[0])} → ${this.formatSize(stats.sizes[1])}`;
             }
-            progress.finish(true, `OCR added to all ${finalTotal} files` + sizeStr);
+            progress.finish(true, `OCR added to all ${finalTotal} files` + sizeStr, issues);
           } else {
-            progress.finish(false, `Done: ${successCount} processed, ${failCount} failed`, issues);
+            progress.finish(false, `Done: ${stats.success} processed, ${stats.fail} failed`, issues);
           }
         }
       }
 
-      return { successCount, failCount };
+      return { successCount: stats.success, failCount: stats.fail };
     } finally {
       this._isProcessing = false;
     }
@@ -805,13 +837,10 @@ class ZoteroDJVUConverter {
     this.log(`Executing compression for ${fileCount} file(s)`);
     this._isProcessing = true;
     let progress = null;
-    let successCount = 0;
-    let failCount = 0;
-    let lastSizeInfo = null;
-    let totalInputSize = 0;
-    let totalOutputSize = 0;
-    // Per-file problems shown in the progress dialog
-    const issues = [];
+    // Results accumulate across all queued operations so the final summary
+    // covers every file, not just the last operation
+    const stats = this.getQueueStats("compress");
+    const issues = this._queueSession.issues;
 
     // Helper to get current total (dynamic - updates as queue changes)
     const getTotal = () => globalOffset + this.getTotalFilesInQueue();
@@ -835,7 +864,7 @@ class ZoteroDJVUConverter {
           const filePath = await item.getFilePathAsync();
           if (!filePath) {
             issues.push(this.describeIssue(item, null, "Attachment file not found on disk (not downloaded yet, moved, or a linked file that no longer exists)"));
-            failCount++;
+            stats.fail++;
             continue;
           }
 
@@ -850,11 +879,11 @@ class ZoteroDJVUConverter {
           progress.updateText(`${getBatchPrefix()}Compressing: ${filename}`);
 
           const sizeInfo = await this.compressSinglePdf(item, filePath, options, progress, globalFileNum, getBatchPrefix);
-          successCount++;
+          stats.success++;
           if (sizeInfo) {
-            lastSizeInfo = sizeInfo;
-            totalInputSize += sizeInfo.inputSize || 0;
-            totalOutputSize += sizeInfo.outputSize || 0;
+            stats.lastSizeInfo = sizeInfo;
+            stats.sizes[0] += sizeInfo.inputSize || 0;
+            stats.sizes[1] += sizeInfo.outputSize || 0;
           }
         } catch (e) {
           this.log(`Error compressing file ${globalFileNum}: ${e.message}`);
@@ -862,7 +891,7 @@ class ZoteroDJVUConverter {
             break;
           }
           issues.push(this.describeIssue(item, null, e.message));
-          failCount++;
+          stats.fail++;
         }
       }
 
@@ -870,40 +899,42 @@ class ZoteroDJVUConverter {
       const hasMoreQueued = this._operationQueue.length > 0;
       if (!hasMoreQueued) {
         const finalTotal = getTotal();
-        if (finalTotal === 1) {
+        if (this.isMixedQueueSession()) {
+          this.finishMixedSummary(progress, finalTotal);
+        } else if (finalTotal === 1) {
           if (progress.cancelled) {
             progress.finish(false, "Compression cancelled");
-          } else if (successCount === 1) {
+          } else if (stats.success === 1) {
             // Build size info string: input → output
             let sizeStr = "";
-            if (lastSizeInfo && lastSizeInfo.inputSize) {
-              if (lastSizeInfo.replaced) {
-                sizeStr = ` ${this.formatSize(lastSizeInfo.inputSize)} → ${this.formatSize(lastSizeInfo.outputSize)}`;
+            if (stats.lastSizeInfo && stats.lastSizeInfo.inputSize) {
+              if (stats.lastSizeInfo.replaced) {
+                sizeStr = ` ${this.formatSize(stats.lastSizeInfo.inputSize)} → ${this.formatSize(stats.lastSizeInfo.outputSize)}`;
               } else {
-                sizeStr = ` ${this.formatSize(lastSizeInfo.inputSize)} (kept original)`;
+                sizeStr = ` ${this.formatSize(stats.lastSizeInfo.inputSize)} (kept original)`;
               }
             }
-            progress.finish(true, "Done!" + sizeStr);
+            progress.finish(true, "Done!" + sizeStr, issues);
           } else {
             progress.finish(false, "Compression failed", issues);
           }
         } else {
-          const totalSuccess = globalOffset + successCount;
+          const totalSuccess = this.getQueueSuccessCount();
           if (progress.cancelled) {
             progress.finish(false, `Cancelled after ${totalSuccess}/${finalTotal}`);
-          } else if (failCount === 0) {
+          } else if (stats.fail === 0) {
             let sizeStr = "";
-            if (totalInputSize && totalOutputSize) {
-              sizeStr = ` • ${this.formatSize(totalInputSize)} → ${this.formatSize(totalOutputSize)}`;
+            if (stats.sizes[0] && stats.sizes[1]) {
+              sizeStr = ` • ${this.formatSize(stats.sizes[0])} → ${this.formatSize(stats.sizes[1])}`;
             }
-            progress.finish(true, `All ${finalTotal} files compressed` + sizeStr);
+            progress.finish(true, `All ${finalTotal} files compressed` + sizeStr, issues);
           } else {
-            progress.finish(false, `Done: ${successCount} compressed, ${failCount} failed`, issues);
+            progress.finish(false, `Done: ${stats.success} compressed, ${stats.fail} failed`, issues);
           }
         }
       }
 
-      return { successCount, failCount };
+      return { successCount: stats.success, failCount: stats.fail };
     } finally {
       this._isProcessing = false;
     }

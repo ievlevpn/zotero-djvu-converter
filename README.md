@@ -181,6 +181,9 @@ Make sure the required language pack is installed:
 
 ## Changelog
 
+### v1.9.1
+- **Correct Batch Summaries**: When files were queued behind a running operation, the final message only reflected the last queued operation — it could report "All files converted" although an earlier file had failed, lose the failure reasons, and total only part of the file sizes. Results now accumulate across the whole queue; runs that mix operation types (e.g. convert, then OCR) get a neutral "N succeeded, M failed" summary
+
 ### v1.9.0
 - **Much Smaller PDFs**: New "Page images" option in the conversion dialogs. `ddjvu` normally renders every page as a full-colour lossless image, so PDFs came out ~10× larger than the DJVU. In **Auto** mode (default) each page is checked first: pages with only text are converted as pure black & white (compressed to JBIG2 by the compression step), while pages with pictures, grey shapes or colour keep their colour. A 479-page textbook went from 178.7 MB to 19.6 MB
   - **Colour** keeps the previous behaviour; **Black & white** converts all pages (smallest, drops pictures)
