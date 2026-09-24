@@ -5,7 +5,8 @@
 set -e
 
 PLUGIN_NAME="djvu-converter"
-VERSION="1.9.1"
+# Single source of truth for the version: manifest.json
+VERSION=$(sed -nE 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' manifest.json | head -1)
 OUTPUT_DIR="build"
 XPI_NAME="${PLUGIN_NAME}-${VERSION}.xpi"
 
