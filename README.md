@@ -184,6 +184,13 @@ Make sure the required language pack is installed:
 
 ## Changelog
 
+### v1.10.0
+- **Black & White Text Pages** (Compress PDF): new opt-in option for scanned PDFs. Pages that contain only text are converted to pure black & white and stored as JBIG2 — often several times smaller than the Medium/Maximum levels alone (a 478-page grey/colour text scan went from 178.7 MB to 22.4 MB)
+  - Pages with pictures or colour are left as they are; colourless pages with pictures may become greyscale
+  - Uneven lighting, paper tint and show-through are removed; low-resolution scans are upscaled first so letters stay smooth
+  - Text layers, links and bookmarks are kept; PDFs that aren't scans are left unchanged
+  - No new dependencies: runs as a small ocrmypdf plugin bundled with the Zotero plugin
+
 ### v1.9.1
 - **Correct Batch Summaries**: When files were queued behind a running operation, the final message only reflected the last queued operation — it could report "All files converted" although an earlier file had failed, lose the failure reasons, and total only part of the file sizes. Results now accumulate across the whole queue; runs that mix operation types (e.g. convert, then OCR) get a neutral "N succeeded, M failed" summary
 
