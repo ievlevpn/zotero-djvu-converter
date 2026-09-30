@@ -16,6 +16,8 @@ async function startup({ id, version, resourceURI, rootURI }) {
     Services.scriptloader.loadSubScript(rootURI + "src/djvu-converter.js");
 
     DJVUConverter = new ZoteroDJVUConverter();
+    // Where bundled files (e.g. the ocrmypdf plugin) are read from
+    DJVUConverter.rootURI = rootURI;
     await DJVUConverter.init();
 
     // Register notifier immediately on startup

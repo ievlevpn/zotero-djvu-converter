@@ -23,7 +23,9 @@ zip -r "$OUTPUT_DIR/$XPI_NAME" \
     src/ \
     icons/ \
     -x "*.DS_Store" \
-    -x "*__MACOSX*"
+    -x "*__MACOSX*" \
+    -x "*__pycache__*" \
+    -x "*.pyc"
 
 echo ""
 echo "Build complete: $OUTPUT_DIR/$XPI_NAME"

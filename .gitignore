@@ -15,3 +15,7 @@ __MACOSX/
 
 # Notes and screenshots
 notes/
+
+# Python bytecode (from testing the ocrmypdf plugin)
+__pycache__/
+*.pyc

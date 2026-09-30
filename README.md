@@ -117,6 +117,7 @@ Right-click on items in your library to access:
 | Remove cover (first page) | Skips the cover page; in the Compress PDF dialog this requires qpdf or ghostscript |
 | Page images | **Auto** (default): pages with only text become pure black & white, pages with pictures or colour stay in colour (mixing both requires qpdf). **Colour**: every page as scanned (largest). **Black & white**: all pages (smallest, drops pictures) |
 | Compress PDF | Reduces file size (requires ocrmypdf) |
+| Black & white text pages | Compress PDF only; off by default. Scanned pages that contain only text become pure black & white (JBIG2 with jbig2enc, otherwise CCITT G4) — often several times smaller. Pages with pictures or colour are left as they are, colourless scans with pictures may become greyscale; text layers, links and bookmarks are kept. Removes paper tint and shading. Runs as a bundled ocrmypdf plugin, no extra dependencies |
 | Lossy JBIG2 | Off by default. Much smaller B/W scans, but may substitute similar-looking characters (requires jbig2enc) |
 | Downsample images to 200 DPI | Off by default. Visibly lossy; biggest size reduction for high-resolution scans (requires ghostscript). May slightly reduce OCR accuracy when combined with OCR |
 | Replace DJVU with PDF | Removes original DJVU after conversion |
@@ -148,11 +149,13 @@ zotero-djvu-converter/
 ├── manifest.json      # Plugin metadata
 ├── bootstrap.js       # Plugin lifecycle hooks
 ├── src/
-│   └── djvu-converter.js  # Main plugin logic
+│   ├── djvu-converter.js  # Main plugin logic
+│   └── bw_text_pages.py   # ocrmypdf plugin for "Black & white text pages"
 ├── icons/
 │   ├── icon48.png
 │   └── icon96.png
 ├── build.sh           # Build script
+├── release.sh         # Build, tag and publish a release
 └── README.md
 ```
 

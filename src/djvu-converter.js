@@ -362,9 +362,11 @@ class ZoteroDJVUConverter {
     return { container, getValue: () => select.value };
   }
 
-  // Create the lossy compression options section (both off by default)
+  // Create the lossy compression options section (all off by default).
+  // withBwTextPages adds the black & white text pages option (Compress PDF only;
+  // DJVU conversion has its own page image mode).
   // Returns { container, getOptions }
-  createLossyOptionsSection(doc, idPrefix) {
+  createLossyOptionsSection(doc, idPrefix, { withBwTextPages = false } = {}) {
     const S = ZoteroDJVUConverter.STYLES;
     const container = this.createSection(doc);
 
@@ -372,6 +374,16 @@ class ZoteroDJVUConverter {
     label.textContent = "Aggressive compression (lossy):";
     label.style.cssText = S.LABEL_SMALL;
     container.appendChild(label);
+
+    let bwCheck = null;
+    if (withBwTextPages) {
+      ({ checkbox: bwCheck } = this.createCheckbox(
+        doc, `${idPrefix}-bw-text-pages`,
+        "Black & white text pages (scans with only text; removes paper tint and shading)",
+        false, !this.ocrmypdfFound
+      ));
+      container.appendChild(bwCheck.parentNode);
+    }
 
     const jbig2Available = this.jbig2Found && this.ocrmypdfFound;
     const { label: jbig2Label, checkbox: jbig2Check } = this.createCheckbox(
@@ -397,7 +409,8 @@ class ZoteroDJVUConverter {
       container,
       getOptions: () => ({
         jbig2Lossy: jbig2Available && jbig2Check.checked,
-        downsample: gsAvailable && dsCheck.checked
+        downsample: gsAvailable && dsCheck.checked,
+        bwTextPages: !!(bwCheck && bwCheck.checked)
       })
     };
   }
@@ -1460,7 +1473,7 @@ class ZoteroDJVUConverter {
           const fileAge = now - stat.lastModified;
 
           if (fileAge > ONE_HOUR) {
-            await IOUtils.remove(entryPath, { ignoreAbsent: true });
+            await IOUtils.remove(entryPath, { ignoreAbsent: true, recursive: true });
             cleanedCount++;
           }
         } catch (e) {
@@ -2717,7 +2730,7 @@ class ZoteroDJVUConverter {
       return;
     }
 
-    this.log(`Compression level: ${options.compressLevel}, removeCover=${options.removeCover}`);
+    this.log(`Compression level: ${options.compressLevel}, removeCover=${options.removeCover}, bwTextPages=${options.bwTextPages}`);
 
     // Queue or execute the compression operation
     await this.enqueueOperation("compress", pdfItems, options);
@@ -2758,7 +2771,8 @@ class ZoteroDJVUConverter {
         optimizeLevel,
         true,       // skipOcr - only compress, no OCR
         getBatchPrefix,
-        options.jbig2Lossy
+        options.jbig2Lossy,
+        options.bwTextPages
       );
 
       if (success && Zotero.File.pathToFile(compressedPath).exists()) {
@@ -2836,7 +2850,7 @@ class ZoteroDJVUConverter {
       dialog.appendChild(compressContainer);
 
       // Lossy compression options (off by default)
-      const lossySection = this.createLossyOptionsSection(doc, "djvu-batch-compress");
+      const lossySection = this.createLossyOptionsSection(doc, "djvu-batch-compress", { withBwTextPages: true });
       dialog.appendChild(lossySection.container);
 
       // Remove cover checkbox (covers are often heavy scanned images)
@@ -3089,7 +3103,7 @@ class ZoteroDJVUConverter {
       this.appendCompressionHint(doc, dialog);
 
       // Lossy compression options (off by default)
-      const lossySection = this.createLossyOptionsSection(doc, "djvu-compress");
+      const lossySection = this.createLossyOptionsSection(doc, "djvu-compress", { withBwTextPages: true });
       dialog.appendChild(lossySection.container);
 
       // Remove cover checkbox (covers are often heavy scanned images)
@@ -4201,9 +4215,21 @@ class ZoteroDJVUConverter {
     this.log("Updated attachment to point to PDF");
   }
 
+  // Copy the bundled ocrmypdf plugin (src/bw_text_pages.py) out of the XPI so
+  // ocrmypdf can load it; rewritten per run since old temp files get cleaned up.
+  // Its own folder keeps Python's __pycache__ inside something we clean up.
+  async writeBwTextPagesPlugin() {
+    const source = await Zotero.File.getResourceAsync(this.rootURI + "src/bw_text_pages.py");
+    const dir = PathUtils.join(Zotero.getTempDirectory().path, "djvu_conv_bw_plugin");
+    await IOUtils.makeDirectory(dir, { ignoreExisting: true });
+    const path = PathUtils.join(dir, "bw_text_pages.py");
+    await IOUtils.writeUTF8(path, source);
+    return path;
+  }
+
   // Build the ocrmypdf command string
   buildOcrmypdfCommand(inputPath, outputPath, errorLogFile, options = {}) {
-    const { forceOcr = false, languages = 'eng', optimizeLevel = 1, skipOcr = false, jbig2Lossy = false } = options;
+    const { forceOcr = false, languages = 'eng', optimizeLevel = 1, skipOcr = false, jbig2Lossy = false, bwPluginPath = null } = options;
 
     // Validate language string (only allow alphanumeric, underscore, plus)
     let safeLangs = (languages || 'eng').replace(/[^a-zA-Z0-9_+]/g, '');
@@ -4218,19 +4244,23 @@ class ZoteroDJVUConverter {
     const outputType = skipOcr ? "--output-type pdf " : "";
     // Lossy JBIG2 only applies when the optimizer runs and jbig2enc is present
     const jbig2Flag = (jbig2Lossy && this.jbig2Found && optLevel >= 1) ? "--jbig2-lossy " : "";
+    // Bundled ocrmypdf plugin that converts text-only page scans to black & white
+    const bwFlag = bwPluginPath
+      ? `--plugin "${this.isWindows() ? this.escapeWindowsPath(bwPluginPath) : this.escapeShellPath(bwPluginPath)}" --bw-text-pages `
+      : "";
 
     if (this.isWindows()) {
       const escapedInput = this.escapeWindowsPath(inputPath);
       const escapedOutput = this.escapeWindowsPath(outputPath);
       const escapedLogFile = this.escapeWindowsPath(errorLogFile);
       const escapedTool = this.escapeWindowsPath(this.ocrmypdfPath);
-      return `"${escapedTool}" -O ${optLevel} ${outputType}${jbig2Flag}${ocrMode} --skip-big ${skipBig} --tesseract-timeout ${tessTimeout} -v 1 -l ${safeLangs} "${escapedInput}" "${escapedOutput}" 2>"${escapedLogFile}"`;
+      return `"${escapedTool}" -O ${optLevel} ${outputType}${jbig2Flag}${bwFlag}${ocrMode} --skip-big ${skipBig} --tesseract-timeout ${tessTimeout} -v 1 -l ${safeLangs} "${escapedInput}" "${escapedOutput}" 2>"${escapedLogFile}"`;
     } else {
       const pathExport = this.getPathExport();
       const escapedInput = this.escapeShellPath(inputPath);
       const escapedOutput = this.escapeShellPath(outputPath);
       const escapedLogFile = this.escapeShellPath(errorLogFile);
-      return `${pathExport} "${this.ocrmypdfPath}" -O ${optLevel} ${outputType}${jbig2Flag}${ocrMode} --skip-big ${skipBig} --tesseract-timeout ${tessTimeout} -v 1 -l ${safeLangs} "${escapedInput}" "${escapedOutput}" 2>"${escapedLogFile}"`;
+      return `${pathExport} "${this.ocrmypdfPath}" -O ${optLevel} ${outputType}${jbig2Flag}${bwFlag}${ocrMode} --skip-big ${skipBig} --tesseract-timeout ${tessTimeout} -v 1 -l ${safeLangs} "${escapedInput}" "${escapedOutput}" 2>"${escapedLogFile}"`;
     }
   }
 
@@ -4244,6 +4274,14 @@ class ZoteroDJVUConverter {
       if (logContent) {
         const isPostprocessing = logContent.includes("Postprocessing");
         const isOptimizing = logContent.includes("Optimizable images");
+
+        // Pages logged by the bundled black & white plugin (runs before the optimizer)
+        const bwPages = !isOptimizing && logContent.match(/bw-text-pages: page (\d+)/g);
+        if (bwPages) {
+          statusText = "Converting text pages to black & white";
+          const page = bwPages[bwPages.length - 1].match(/(\d+)/)[1];
+          return { statusText, pageInfo: pageCount > 0 ? ` • page ${page}/${pageCount}` : ` • page ${page}` };
+        }
 
         if (isOptimizing) {
           statusText = "Optimizing";
@@ -4292,7 +4330,7 @@ class ZoteroDJVUConverter {
     }
   }
 
-  async runOcrWithProgress(inputPath, outputPath, progress, forceOcr = false, languages = "eng", pageCount = null, optimizeLevel = 1, skipOcr = false, getBatchPrefix = () => "", jbig2Lossy = false) {
+  async runOcrWithProgress(inputPath, outputPath, progress, forceOcr = false, languages = "eng", pageCount = null, optimizeLevel = 1, skipOcr = false, getBatchPrefix = () => "", jbig2Lossy = false, bwTextPages = false) {
     const modeDesc = skipOcr ? "compression-only" : (forceOcr ? "force-OCR" : "OCR");
     this.log(`Starting ${modeDesc} process...`);
 
@@ -4324,8 +4362,9 @@ class ZoteroDJVUConverter {
     this.log(`Languages: ${languages}, pages: ${pageCount || "unknown"}, optimize: -O ${optimizeLevel}, skipOcr: ${skipOcr}`);
 
     // Build command using helper with safe temp paths
+    const bwPluginPath = bwTextPages ? await this.writeBwTextPagesPlugin() : null;
     const ocrCmd = this.buildOcrmypdfCommand(tempInputPath, tempOutputPath, errorLogFile, {
-      forceOcr, languages, optimizeLevel, skipOcr, jbig2Lossy
+      forceOcr, languages, optimizeLevel, skipOcr, jbig2Lossy, bwPluginPath
     });
     this.log(`OCR command: ${ocrCmd}`);
 
