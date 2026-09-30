@@ -377,12 +377,9 @@ class ZoteroDJVUConverter {
 
     let bwCheck = null;
     if (withBwTextPages) {
-      ({ checkbox: bwCheck } = this.createCheckbox(
-        doc, `${idPrefix}-bw-text-pages`,
-        "Black & white text pages (scans with only text; removes paper tint and shading)",
-        false, !this.ocrmypdfFound
-      ));
-      container.appendChild(bwCheck.parentNode);
+      const bw = this.createBwTextPagesCheckbox(doc, `${idPrefix}-bw-text-pages`);
+      bwCheck = bw.checkbox;
+      container.appendChild(bw.label);
     }
 
     const jbig2Available = this.jbig2Found && this.ocrmypdfFound;
@@ -413,6 +410,15 @@ class ZoteroDJVUConverter {
         bwTextPages: !!(bwCheck && bwCheck.checked)
       })
     };
+  }
+
+  // "Black & white text pages" checkbox (Compress PDF and Add OCR dialogs)
+  createBwTextPagesCheckbox(doc, id) {
+    return this.createCheckbox(
+      doc, id,
+      "Black & white text pages (scans with only text; removes paper tint and shading)",
+      false, !this.ocrmypdfFound
+    );
   }
 
   // Create disabled feature note
@@ -2484,7 +2490,7 @@ class ZoteroDJVUConverter {
       return;
     }
 
-    this.log(`OCR options: forceOcr=${options.forceOcr}, languages=${options.languages}, optimizeLevel=${options.optimizeLevel}`);
+    this.log(`OCR options: forceOcr=${options.forceOcr}, languages=${options.languages}, optimizeLevel=${options.optimizeLevel}, bwTextPages=${options.bwTextPages}`);
 
     // Queue or execute the OCR operation
     await this.enqueueOperation("ocr", pdfItems, options);
@@ -2514,7 +2520,9 @@ class ZoteroDJVUConverter {
         pageCount,
         options.optimizeLevel,
         false,
-        getBatchPrefix
+        getBatchPrefix,
+        false,      // jbig2Lossy
+        options.bwTextPages
       );
 
       if (ocrSuccess && Zotero.File.pathToFile(ocrPdfPath).exists()) {
@@ -2617,6 +2625,11 @@ class ZoteroDJVUConverter {
       this.appendCompressionHint(doc, compressContainer);
       dialog.appendChild(compressContainer);
 
+      // OCR runs on the original scans; text pages are converted afterwards
+      const { label: bwLabel, checkbox: bwCheck } = this.createBwTextPagesCheckbox(doc, "djvu-batch-ocr-bw-text-pages");
+      bwLabel.style.marginBottom = "20px";
+      dialog.appendChild(bwLabel);
+
       // Cleanup function
       const cleanup = () => {
         doc.removeEventListener("keydown", handleKeydown);
@@ -2648,7 +2661,8 @@ class ZoteroDJVUConverter {
         resolve({
           forceOcr: forceCheckbox.checked,
           languages: selectedLangs.length > 0 ? selectedLangs.join("+") : "eng",
-          optimizeLevel: parseInt(compressSelect.value, 10)
+          optimizeLevel: parseInt(compressSelect.value, 10),
+          bwTextPages: bwCheck.checked
         });
       });
 
@@ -3027,9 +3041,14 @@ class ZoteroDJVUConverter {
         { value: "maximum", label: "Maximum (smallest file)" }
       ];
       const optimizeSelect = this.createSelect(doc, optimizeOptions, "medium");
-      optimizeSelect.style.marginBottom = "20px";
+      optimizeSelect.style.marginBottom = "12px";
       dialog.appendChild(optimizeSelect);
       this.appendCompressionHint(doc, dialog);
+
+      // OCR runs on the original scans; text pages are converted afterwards
+      const { label: bwLabel, checkbox: bwCheck } = this.createBwTextPagesCheckbox(doc, "djvu-ocr-bw-text-pages");
+      bwLabel.style.marginBottom = "20px";
+      dialog.appendChild(bwLabel);
 
       // Cleanup function
       const cleanup = () => {
@@ -3048,7 +3067,11 @@ class ZoteroDJVUConverter {
         const selectedLangs = langChecks.filter(c => c.checked).map(c => c.value);
         const ocrLangs = selectedLangs.length > 0 ? selectedLangs.join("+") : "eng";
         cleanup();
-        resolve({ languages: ocrLangs, optimizeLevel: ZoteroDJVUConverter.getOptimizeLevel(optimizeSelect.value) });
+        resolve({
+          languages: ocrLangs,
+          optimizeLevel: ZoteroDJVUConverter.getOptimizeLevel(optimizeSelect.value),
+          bwTextPages: bwCheck.checked
+        });
       });
       buttons.appendChild(okBtn);
 
