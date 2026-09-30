@@ -184,6 +184,9 @@ Make sure the required language pack is installed:
 
 ## Changelog
 
+### v1.11.0
+- **Black & White Text Pages in Add OCR Layer**: the option from v1.10.0 is now also in the Add OCR dialogs (single and batch), so a scanned PDF without a text layer can get OCR and be shrunk in one run. Text is recognized from the original scans before pages are converted, so OCR quality is unaffected
+
 ### v1.10.0
 - **Black & White Text Pages** (Compress PDF): new opt-in option for scanned PDFs. Pages that contain only text are converted to pure black & white and stored as JBIG2 — often several times smaller than the Medium/Maximum levels alone (a 478-page grey/colour text scan went from 178.7 MB to 22.4 MB)
   - Pages with pictures or colour are left as they are; colourless pages with pictures may become greyscale
