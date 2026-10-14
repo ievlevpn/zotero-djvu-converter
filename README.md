@@ -26,7 +26,7 @@ A Zotero plugin that converts DJVU files to PDF with optional OCR and compressio
 ## Requirements
 
 ### Zotero
-- Zotero 7.0 or later
+- Zotero 7.0 or later (tested up to Zotero 11)
 
 ### External Dependencies
 
@@ -183,6 +183,9 @@ Make sure the required language pack is installed:
 - **Windows**: Download language packs from [Tesseract GitHub](https://github.com/tesseract-ocr/tessdata)
 
 ## Changelog
+
+### v1.11.1
+- Compatibility: verified against Zotero 11 and raised the maximum supported version to 11.*
 
 ### v1.11.0
 - **Black & White Text Pages in Add OCR Layer**: the option from v1.10.0 is now also in the Add OCR dialogs (single and batch), so a scanned PDF without a text layer can get OCR and be shrunk in one run. Text is recognized from the original scans before pages are converted, so OCR quality is unaffected
